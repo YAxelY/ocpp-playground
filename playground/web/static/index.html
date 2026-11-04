@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OCPP Playground</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>⚡ OCPP Playground</h1>
+  <span class="badge ver v201">2.0.1</span><span class="badge ver v21">2.1</span>
+  <div class="tabs" role="tablist">
+    <button class="tab on" data-tab="liveTab" role="tab">Live</button>
+    <button class="tab" data-tab="schemaTab" role="tab">Schemas 2.0.1 ↔ 2.1</button>
+  </div>
+  <span id="conn">connecting…</span>
+</header>
+
+<main id="liveTab">
+  <section class="col">
+    <div class="card policy" id="policy"></div>
+    <div id="stations" class="col"></div>
+    <div class="card">
+      <h2>Add a station</h2>
+      <div class="row">
+        <span class="lbl">offers</span>
+        <select id="newOffer">
+          <option value="ocpp2.1,ocpp2.0.1">2.1 + 2.0.1</option>
+          <option value="ocpp2.1">2.1 only</option>
+          <option value="ocpp2.0.1">2.0.1 only</option>
+          <option value="ocpp1.6">1.6 only</option>
+        </select>
+        <span class="lbl">EVSEs</span><input id="newEvses" type="number" min="1" max="4" value="1">
+        <button id="addStation" class="primary">Add</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="seq">
+    <div id="seqbar">
+      <span class="sub">Show:</span><span id="filters"></span>
+      <label class="sub"><input type="checkbox" id="hideNoise"> hide Heartbeats & meter values</label>
+      <button id="clear" style="margin-left:auto">Clear</button>
+    </div>
+    <div class="legend">
+      <span class="k-CALL">CALL [2]</span><span class="k-CALLRESULT">CALLRESULT [3]</span><span class="k-CALLERROR">CALLERROR [4]</span>
+      <span class="k-CALLRESULTERROR">CALLRESULTERROR [5] (2.1)</span><span class="k-SEND">SEND [6] (2.1, never answered)</span>
+      <span class="k-INVALID">not valid OCPP-J</span>
+    </div>
+    <div id="lanes"><span>time</span><span>station</span><span>Charging Station ⟷ CSMS</span><span></span></div>
+    <div id="log" aria-live="polite"></div>
+  </section>
+</main>
+
+<main id="schemaTab" class="hidden">
+  <section class="card">
+    <h2>Message schemas</h2>
+    <div class="row"><input id="schemaFilter" type="text" placeholder="filter…" style="flex:1"></div>
+    <div class="row sub">
+      <label><input type="checkbox" id="onlyChanged"> only changed / new</label>
+    </div>
+    <div id="schemaList"></div>
+  </section>
+  <section class="card" id="schemaDiff"><p class="sub">Pick a message on the left to compare its OCPP 2.0.1 and 2.1 schemas.</p></section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

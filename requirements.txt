@@ -1,0 +1,3 @@
+ocpp>=2.1,<3
+websockets>=14
+jsonschema>=4
