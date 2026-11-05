@@ -9,29 +9,32 @@
 <body>
 <header>
   <h1>⚡ OCPP Playground</h1>
-  <span class="badge ver v201">2.0.1</span><span class="badge ver v21">2.1</span>
-  <div class="tabs" role="tablist">
-    <button class="tab on" data-tab="liveTab" role="tab">Live</button>
-    <button class="tab" data-tab="schemaTab" role="tab">Schemas 2.0.1 ↔ 2.1</button>
-  </div>
+  <span class="badge ver v16">1.6</span><span class="badge ver v201">2.0.1</span><span class="badge ver v21">2.1</span>
+  <nav class="tabs" role="tablist">
+    <button class="tab on" data-tab="liveTab" role="tab">🔴 Live</button>
+    <button class="tab" data-tab="guideTab" role="tab">📖 How to read the diagram</button>
+    <button class="tab" data-tab="schemaTab" role="tab">🧩 Compare schemas</button>
+  </nav>
   <span id="conn">connecting…</span>
 </header>
 
+<!-- ============================================================ LIVE -->
 <main id="liveTab">
   <section class="col">
     <div class="card policy" id="policy"></div>
     <div id="stations" class="col"></div>
     <div class="card">
-      <h2>Add a station</h2>
+      <h2>➕ Add a charging station</h2>
       <div class="row">
-        <span class="lbl">offers</span>
+        <span class="lbl">it speaks</span>
         <select id="newOffer">
           <option value="ocpp2.1,ocpp2.0.1">2.1 + 2.0.1</option>
           <option value="ocpp2.1">2.1 only</option>
           <option value="ocpp2.0.1">2.0.1 only</option>
+          <option value="ocpp2.0.1,ocpp1.6">2.0.1 + 1.6</option>
           <option value="ocpp1.6">1.6 only</option>
         </select>
-        <span class="lbl">EVSEs</span><input id="newEvses" type="number" min="1" max="4" value="1">
+        <span class="lbl">connectors</span><input id="newEvses" type="number" min="1" max="4" value="1">
         <button id="addStation" class="primary">Add</button>
       </div>
     </div>
@@ -44,25 +47,104 @@
       <button id="clear" style="margin-left:auto">Clear</button>
     </div>
     <div class="legend">
-      <span class="k-CALL">CALL [2]</span><span class="k-CALLRESULT">CALLRESULT [3]</span><span class="k-CALLERROR">CALLERROR [4]</span>
-      <span class="k-CALLRESULTERROR">CALLRESULTERROR [5] (2.1)</span><span class="k-SEND">SEND [6] (2.1, never answered)</span>
-      <span class="k-INVALID">not valid OCPP-J</span>
+      <span class="k-CALL">📨 CALL = asks</span><span class="k-CALLRESULT">✅ CALLRESULT = answers</span>
+      <span class="k-CALLERROR">❌ CALLERROR = refuses (broken request)</span>
+      <span class="k-CALLRESULTERROR">⛔ CALLRESULTERROR (2.1)</span><span class="k-SEND">📣 SEND (2.1, no answer)</span>
+      <span class="k-INVALID">⚠️ not valid OCPP-J</span>
     </div>
-    <div id="lanes"><span>time</span><span>station</span><span>Charging Station ⟷ CSMS</span><span></span></div>
+    <div class="lanes"><span class="sub">time</span>
+      <div class="ends"><span>🔌 Charging station</span><span>CSMS 🖥️</span></div><span></span></div>
     <div id="log" aria-live="polite"></div>
+    <div id="explain" class="hidden"></div>
   </section>
 </main>
 
+<!-- ============================================================ GUIDE -->
+<main id="guideTab" class="hidden">
+  <section class="card guide">
+    <h2>📖 Reading a message-exchange diagram: who sends what to whom?</h2>
+    <p>Every OCPP conversation is drawn the same way: <b>two people facing each other</b>. On the left the
+      <b>charging station 🔌</b>, on the right the <b>CSMS 🖥️</b> (the backend). Time flows <b>downwards</b>.
+      Each horizontal arrow is <b>one message</b>.</p>
+    <svg class="anatomy" viewBox="0 0 980 560" role="img" aria-label="Annotated example of a message sequence">
+      <defs>
+        <marker id="h-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+        <marker id="h-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#15803d"/></marker>
+        <marker id="h-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/></marker>
+        <marker id="h-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#0d9488"/></marker>
+      </defs>
+      <rect x="80" y="10" width="200" height="50" rx="10" fill="none" stroke="#9aa6b2"/>
+      <text x="180" y="42" text-anchor="middle" font-size="16">🔌 Charging station</text>
+      <rect x="700" y="10" width="200" height="50" rx="10" fill="none" stroke="#9aa6b2"/>
+      <text x="800" y="42" text-anchor="middle" font-size="16">🖥️ CSMS</text>
+      <line x1="180" y1="60" x2="180" y2="545" stroke="#9aa6b2" stroke-dasharray="5 5"/>
+      <line x1="800" y1="60" x2="800" y2="545" stroke="#9aa6b2" stroke-dasharray="5 5"/>
+      <!-- 1 -->
+      <line x1="182" y1="110" x2="796" y2="110" stroke="#2563eb" stroke-width="2.5" marker-end="url(#h-blue)"/>
+      <text x="490" y="100" text-anchor="middle" fill="#2563eb" font-weight="700">📨 BootNotification  [2]  #a1</text>
+      <text x="20" y="114" class="callout">① sender</text><text x="905" y="114" class="callout">② receiver</text>
+      <text x="490" y="128" text-anchor="middle" class="muted">"I just started, here is who I am" — a request (CALL)</text>
+      <!-- 2 -->
+      <line x1="798" y1="180" x2="184" y2="180" stroke="#15803d" stroke-width="2.5" marker-end="url(#h-green)"/>
+      <text x="490" y="170" text-anchor="middle" fill="#15803d" font-weight="700">✅ answer  [3]  #a1  · status Pending</text>
+      <text x="490" y="198" text-anchor="middle" class="muted">③ same id #a1 → this is the answer to ① (an answer has no action name)</text>
+      <!-- 3 -->
+      <line x1="798" y1="250" x2="184" y2="250" stroke="#2563eb" stroke-width="2.5" marker-end="url(#h-blue)"/>
+      <text x="490" y="240" text-anchor="middle" fill="#2563eb" font-weight="700">📨 GetVariables  [2]  #b7</text>
+      <text x="490" y="268" text-anchor="middle" class="muted">④ the CSMS can ask too: the arrow points the other way</text>
+      <line x1="182" y1="300" x2="796" y2="300" stroke="#15803d" stroke-width="2.5" marker-end="url(#h-green)"/>
+      <text x="490" y="290" text-anchor="middle" fill="#15803d" font-weight="700">✅ answer  [3]  #b7</text>
+      <!-- 4 -->
+      <line x1="182" y1="360" x2="796" y2="360" stroke="#2563eb" stroke-width="2.5" marker-end="url(#h-blue)"/>
+      <text x="490" y="350" text-anchor="middle" fill="#2563eb" font-weight="700">📨 Heartbeat  [2]  #c3</text>
+      <line x1="798" y1="410" x2="184" y2="410" stroke="#dc2626" stroke-width="2.5" marker-end="url(#h-red)"/>
+      <text x="490" y="400" text-anchor="middle" fill="#dc2626" font-weight="700">❌ CALLERROR  [4]  #c3  SecurityError</text>
+      <text x="490" y="428" text-anchor="middle" class="muted">⑤ refused: the station sent something before being Accepted</text>
+      <!-- 5 -->
+      <line x1="182" y1="480" x2="796" y2="480" stroke="#0d9488" stroke-width="2.5" stroke-dasharray="3 5" marker-end="url(#h-teal)"/>
+      <text x="490" y="470" text-anchor="middle" fill="#0d9488" font-weight="700">📣 NotifyPeriodicEventStream  [6]  (OCPP 2.1)</text>
+      <text x="490" y="498" text-anchor="middle" class="muted">⑥ a SEND: nobody answers it, so no arrow comes back</text>
+      <text x="490" y="540" text-anchor="middle" class="muted">↓ time</text>
+    </svg>
+    <h2>How to read one arrow</h2>
+    <ol>
+      <li><b>Who sends:</b> where the arrow <i>starts</i>. <b>Who receives:</b> where the <i>arrowhead</i> points.</li>
+      <li><b>What kind:</b> the colour and the number in brackets (the first element of the JSON array).</li>
+      <li><b>About what:</b> the action name on a request (BootNotification, Heartbeat…).</li>
+      <li><b>Which question it answers:</b> the <b>id</b>. An answer always copies the id of its request.</li>
+      <li><b>Business "no" ≠ error:</b> "status: Rejected" is a normal green answer. Red means the request itself was broken or not allowed.</li>
+    </ol>
+    <h2>The five kinds of arrow</h2>
+    <div class="types">
+      <div class="type k-CALL"><span class="pic">📨</span><b>CALL [2]: asks</b><span class="sub">a request; the other side must answer</span><br><code>[2, id, Action, {…}]</code></div>
+      <div class="type k-CALLRESULT"><span class="pic">✅</span><b>CALLRESULT [3]: answers</b><span class="sub">same id as the request</span><br><code>[3, id, {…}]</code></div>
+      <div class="type k-CALLERROR"><span class="pic">❌</span><b>CALLERROR [4]: refuses</b><span class="sub">the request was broken / not allowed</span><br><code>[4, id, code, text, {…}]</code></div>
+      <div class="type k-CALLRESULTERROR"><span class="pic">⛔</span><b>CALLRESULTERROR [5]</b><span class="sub">2.1 only: "your answer was broken"</span><br><code>[5, id, code, text, {…}]</code></div>
+      <div class="type k-SEND"><span class="pic">📣</span><b>SEND [6]: tells</b><span class="sub">2.1 only: never answered</span><br><code>[6, id, Action, {…}]</code></div>
+    </div>
+    <h2>In the Live tab</h2>
+    <p>🖱️ <b>Hover</b> an arrow: its request/answer partner lights up. <b>Click</b> it: a panel explains who sent it to whom,
+      what it means, what it answers, and every field. The pictures on the left show what each side <i>believes</i>:
+      the station's screen, the link to the CSMS, cars on the cables.</p>
+  </section>
+</main>
+
+<!-- ============================================================ SCHEMAS -->
 <main id="schemaTab" class="hidden">
   <section class="card">
-    <h2>Message schemas</h2>
-    <div class="row"><input id="schemaFilter" type="text" placeholder="filter…" style="flex:1"></div>
+    <h2>🧩 Compare message schemas</h2>
+    <div class="row"><select id="verA"></select> <span>↔</span> <select id="verB"></select></div>
+    <div class="row"><input id="schemaFilter" type="text" placeholder="filter, e.g. Boot" style="flex:1"></div>
     <div class="row sub">
-      <label><input type="checkbox" id="onlyChanged"> only changed / new</label>
+      <label><input type="checkbox" id="onlyDiff" checked> only differences</label>
+      <label><input type="checkbox" class="kindf" value="request" checked> requests</label>
+      <label><input type="checkbox" class="kindf" value="response" checked> responses</label>
+      <label><input type="checkbox" class="kindf" value="send" checked> SEND</label>
     </div>
+    <div class="row sub" id="schemaCounts"></div>
     <div id="schemaList"></div>
   </section>
-  <section class="card" id="schemaDiff"><p class="sub">Pick a message on the left to compare its OCPP 2.0.1 and 2.1 schemas.</p></section>
+  <section class="card" id="schemaDetail"><p class="sub">Pick a message on the left.</p></section>
 </main>
 
 <script src="app.js"></script>

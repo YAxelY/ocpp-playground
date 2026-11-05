@@ -5,9 +5,9 @@ Client → server messages (JSON):
   {"cmd": "csms", "id": "CS-001", "command": "reset", "args": {...}}      CSMS-initiated request
   {"cmd": "policy", ...fields}                                            change CSMS behaviour
   {"cmd": "add_station", "offer": ["ocpp2.1"], "evses": 1}
-  {"cmd": "schema_diff", "name": "TransactionEventRequest"}               2.0.1 ↔ 2.1 comparison
+  {"cmd": "schema_compare", "a": "1.6", "b": "2.0.1", "action": "BootNotification", "kind": "request"}
   {"cmd": "forget"} · {"cmd": "clear_log"}
-Server → client: {"type": "hello" | "frame" | "note" | "state" | "schema_diff" | "schema_list", ...}
+Server → client: {"type": "hello" | "frame" | "note" | "state" | "schema_compare", ...}
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from websockets.datastructures import Headers
 from websockets.http11 import Response
 
 from ..csms import commands
-from ..protocol import V21, V201, schemas
+from ..protocol import ALL, BY_NAME, schemas
 
 STATIC = Path(__file__).parent / "static"
 
@@ -116,11 +116,9 @@ class Dashboard:
             pg.bus.note("CSMS", "Registrations forgotten: the next BootNotification counts as a first boot")
         elif cmd == "clear_log":
             pg.bus.history.clear()
-        elif cmd == "schema_diff":
-            d = schemas.diff(schemas.store(V201), schemas.store(V21), msg["name"])
-            d["old"] = schemas.store(V201).load(msg["name"]) if d["only_in"] != "2.1" else None
-            d["new"] = schemas.store(V21).load(msg["name"]) if d["only_in"] != "2.0.1" else None
-            queue.put_nowait({"type": "schema_diff", **d})
+        elif cmd == "schema_compare":
+            c = schemas.compare(msg["action"], msg["kind"], BY_NAME[msg["a"]], BY_NAME[msg["b"]])
+            queue.put_nowait({"type": "schema_compare", **c})
             return
         pg.bus.changed()
 
@@ -129,12 +127,9 @@ class Dashboard:
     @classmethod
     def meta(cls) -> dict:
         if cls._meta is None:
-            a, b = schemas.store(V201), schemas.store(V21)
-            files = sorted(set(f[:-5] for f in os.listdir(a.dir) if f.endswith(".json")) |
-                           set(f[:-5] for f in os.listdir(b.dir) if f.endswith(".json")))
-            status = {}
-            for name in files:
-                d = schemas.diff(a, b, name)
-                status[name] = f"only {d['only_in']}" if d["only_in"] else "same" if schemas.is_unchanged(d) else "changed"
-            cls._meta = {"schemas": files, "schema_status": status, "commands": sorted(commands.BUILDERS)}
+            cls._meta = {
+                "versions": [v.name for v in ALL],
+                "catalogue": schemas.catalogue(),
+                "commands": {v.name: {c: commands.message_name(v, c) for c in commands.COMMANDS} for v in ALL},
+            }
         return cls._meta

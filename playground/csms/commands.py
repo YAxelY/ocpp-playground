@@ -1,9 +1,20 @@
-"""CSMS-initiated requests (CSMS → Charging Station), triggered from the dashboard.
+"""CSMS-initiated requests (CSMS → charging station), triggered from the dashboard.
 
-Each command builds the request with the `call` module of the version the station negotiated,
-sends it through the library (which waits for the answer with the same message id) and reports
-the outcome. If a 2.1 station's CALLRESULT is schema-invalid, the CSMS answers it with a
-CALLRESULTERROR (2.1 Part 4 §4.2.3).
+Commands have one generic name and a builder per protocol family, because the messages differ:
+
+| command | 2.0.1 / 2.1 | 1.6 |
+|---|---|---|
+| read_heartbeat | GetVariables(OCPPCommCtrlr.HeartbeatInterval) | GetConfiguration(HeartbeatInterval) |
+| set_heartbeat | SetVariables(…) | ChangeConfiguration(HeartbeatInterval) |
+| full_report | GetBaseReport(FullInventory) → NotifyReport | GetConfiguration() (all keys, in the answer) |
+| reset | Reset(Immediate) | Reset(Soft) |
+| trigger | TriggerMessage | TriggerMessage |
+| change_availability | ChangeAvailability(operationalStatus, evse) | ChangeAvailability(connectorId, type) |
+| request_start | RequestStartTransaction | RemoteStartTransaction |
+| request_stop | RequestStopTransaction | RemoteStopTransaction |
+| unlock | UnlockConnector(evseId, connectorId) | UnlockConnector(connectorId) |
+
+If a 2.1 station's CALLRESULT is schema-invalid, the CSMS answers it with a CALLRESULTERROR (2.1 Part 4 §4.2.3).
 """
 from __future__ import annotations
 
@@ -17,29 +28,47 @@ from ocpp.exceptions import OCPPError
 from ..protocol import schemas
 from ..protocol.frames import MessageType, error_frame
 
-_request_ids = itertools.count(1)
+_ids = itertools.count(1)
 
-# What each command sends. f(call_module, **args) -> payload object
-BUILDERS = {
-    "get_variables": lambda c, component="OCPPCommCtrlr", variable="HeartbeatInterval", **_: c.GetVariables(
-        get_variable_data=[{"component": {"name": component}, "variable": {"name": variable}}]),
-    "set_variables": lambda c, component="OCPPCommCtrlr", variable="HeartbeatInterval", value="20", **_: c.SetVariables(
-        set_variable_data=[{"attribute_value": str(value), "component": {"name": component},
-                            "variable": {"name": variable}}]),
-    "get_base_report": lambda c, report_base="FullInventory", **_: c.GetBaseReport(
-        request_id=next(_request_ids), report_base=report_base),
-    "change_availability": lambda c, operational_status="Inoperative", evse_id=0, **_: c.ChangeAvailability(
-        operational_status=operational_status, **({"evse": {"id": int(evse_id)}} if int(evse_id) else {})),
-    "reset": lambda c, type="Immediate", **_: c.Reset(type=type),
-    "request_start": lambda c, evse_id=1, token="AXEL-0001", **_: c.RequestStartTransaction(
-        id_token={"id_token": token, "type": "ISO14443"}, remote_start_id=next(_request_ids), evse_id=int(evse_id)),
-    "request_stop": lambda c, transaction_id="", **_: c.RequestStopTransaction(transaction_id=transaction_id),
-    "trigger": lambda c, message="StatusNotification", evse_id=0, **_: c.TriggerMessage(
-        requested_message=message, **({"evse": {"id": int(evse_id)}} if int(evse_id) else {})),
+BUILDERS_2X = {
+    "read_heartbeat": lambda c, **a: c.GetVariables(get_variable_data=[
+        {"component": {"name": "OCPPCommCtrlr"}, "variable": {"name": "HeartbeatInterval"}}]),
+    "set_heartbeat": lambda c, value="20", **a: c.SetVariables(set_variable_data=[
+        {"attribute_value": str(value), "component": {"name": "OCPPCommCtrlr"}, "variable": {"name": "HeartbeatInterval"}}]),
+    "full_report": lambda c, **a: c.GetBaseReport(request_id=next(_ids), report_base="FullInventory"),
+    "reset": lambda c, **a: c.Reset(type="Immediate"),
+    "trigger": lambda c, message="StatusNotification", **a: c.TriggerMessage(requested_message=message),
+    "change_availability": lambda c, operational_status="Inoperative", connector=0, **a: c.ChangeAvailability(
+        operational_status=operational_status, **({"evse": {"id": int(connector)}} if int(connector) else {})),
+    "request_start": lambda c, connector=1, token="AXEL-0001", **a: c.RequestStartTransaction(
+        id_token={"id_token": token, "type": "ISO14443"}, remote_start_id=next(_ids), evse_id=int(connector)),
+    "request_stop": lambda c, transaction_id="", **a: c.RequestStopTransaction(transaction_id=str(transaction_id)),
+    "unlock": lambda c, connector=1, **a: c.UnlockConnector(evse_id=int(connector), connector_id=1),
 }
+BUILDERS_16 = {
+    "read_heartbeat": lambda c, **a: c.GetConfiguration(key=["HeartbeatInterval"]),
+    "set_heartbeat": lambda c, value="20", **a: c.ChangeConfiguration(key="HeartbeatInterval", value=str(value)),
+    "full_report": lambda c, **a: c.GetConfiguration(),
+    "reset": lambda c, **a: c.Reset(type="Soft"),
+    "trigger": lambda c, message="StatusNotification", **a: c.TriggerMessage(requested_message=message),
+    "change_availability": lambda c, operational_status="Inoperative", connector=0, **a: c.ChangeAvailability(
+        connector_id=int(connector), type=operational_status),
+    "request_start": lambda c, connector=1, token="AXEL-0001", **a: c.RemoteStartTransaction(
+        id_tag=token, connector_id=int(connector)),
+    "request_stop": lambda c, transaction_id="0", **a: c.RemoteStopTransaction(transaction_id=int(transaction_id)),
+    "unlock": lambda c, connector=1, **a: c.UnlockConnector(connector_id=int(connector)),
+}
+COMMANDS = sorted(BUILDERS_2X)
 
-# Requests a station is allowed to send *because* the CSMS asked (B02.FR.02 exception list).
-TRIGGERED = {"get_base_report": lambda a: "NotifyReport", "trigger": lambda a: a.get("message", "StatusNotification")}
+# Messages a station may send *because* the CSMS asked, even before Accepted (B02.FR.02 / 1.6 §4.2).
+TRIGGERED = {"full_report": lambda v, a: "NotifyReport" if v.is_2x else None,
+             "trigger": lambda v, a: a.get("message", "StatusNotification")}
+
+
+def message_name(version, command: str) -> str:
+    """Which OCPP message a command sends on this version (for the UI labels)."""
+    builders = BUILDERS_2X if version.is_2x else BUILDERS_16
+    return builders[command](version.call).__class__.__name__
 
 
 async def run(csms, station_id: str, name: str, args: dict) -> dict:
@@ -48,39 +77,48 @@ async def run(csms, station_id: str, name: str, args: dict) -> dict:
     if cp is None or rec is None:
         csms.bus.note(station_id, f"Can't send {name}: station is not connected", "warn")
         return {"ok": False}
+    version = cp.version
     if rec.registration == "Rejected":
-        csms.bus.note(station_id, f"{name} not sent: the CSMS SHALL NOT initiate messages to a Rejected station",
-                      "warn", "B03.FR.03")
+        csms.bus.note(station_id, f"{name} not sent: the CSMS must not initiate messages to a Rejected station", "warn",
+                      "1.6 §4.2" if version.name == "1.6" else "B03.FR.03")
         return {"ok": False}
-    if name not in BUILDERS:
-        raise ValueError(f"unknown command {name}")
+    if version.name == "1.6" and rec.registration == "Pending" and name in ("request_start", "request_stop"):
+        csms.bus.note(station_id, "RemoteStart/StopTransaction are not allowed while Pending (OCPP 1.6): not sent",
+                      "warn", "1.6 §4.2")
+        return {"ok": False}
 
-    payload = BUILDERS[name](cp.version.call, **args)
-    if name in TRIGGERED and rec.registration != "Accepted":
-        rec.allowed_once.add(TRIGGERED[name](args))
+    payload = (BUILDERS_2X if version.is_2x else BUILDERS_16)[name](version.call, **args)
+    triggered = TRIGGERED.get(name, lambda v, a: None)(version, args)
+    if triggered and rec.registration != "Accepted":
+        rec.allowed_once.add(triggered)
     uid = str(uuid.uuid4())
     try:
         response = await cp.call(payload, suppress=False, unique_id=uid)
     except asyncio.TimeoutError:
-        csms.bus.note(station_id, f"{name}: no answer in time (the CALL timed out)", "warn", "Part 4 §4.1.1")
+        csms.bus.note(station_id, f"{payload.__class__.__name__}: no answer in time (the CALL timed out)", "warn",
+                      version.ref("§4.1.1"))
         return {"ok": False}
     except OCPPError as e:
-        # Either the station answered with a CALLERROR, or its CALLRESULT failed our schema check.
         answered_with_error = uid in cp._connection.received_errors
-        code = e.code if answered_with_error else schemas.code_for_library_error(e)
-        if not answered_with_error and MessageType.CALLRESULTERROR in cp.version.frame_types:
+        code = e.code if answered_with_error else schemas.code_for_library_error(e, version)
+        if not answered_with_error and MessageType.CALLRESULTERROR in version.frame_types:
             cause = str((e.details or {}).get("cause", e.description))[:255]
             await cp._connection.send(error_frame(uid, code, cause, result_error=True).to_json())
-            csms.bus.note(station_id, f"{name}: station's CALLRESULT is invalid → CALLRESULTERROR {code}",
-                          "warn", "2.1 Part 4 §4.2.3")
+            csms.bus.note(station_id, f"{payload.__class__.__name__}: the station's CALLRESULT is invalid → "
+                                      f"CALLRESULTERROR {code}", "warn", version.ref("§4.2.3"))
         elif not answered_with_error:
-            csms.bus.note(station_id, f"{name}: station's CALLRESULT is invalid ({code}); OCPP 2.0.1 has no "
-                                      "CALLRESULTERROR to report it", "warn")
+            csms.bus.note(station_id, f"{payload.__class__.__name__}: the station's CALLRESULT is invalid ({code}); "
+                                      f"OCPP {version.name} has no CALLRESULTERROR to report it", "warn")
         else:
-            csms.bus.note(station_id, f"{name}: station answered CALLERROR {code}", "warn")
+            csms.bus.note(station_id, f"{payload.__class__.__name__}: station answered CALLERROR {code}", "warn")
         return {"ok": False, "error": code}
+
     result = dataclasses.asdict(response) if dataclasses.is_dataclass(response) else response
-    csms.bus.note(station_id, f"{name} → {_short(result)}")
+    if version.name == "1.6" and name in ("full_report", "read_heartbeat"):
+        for item in result.get("configuration_key") or []:          # 1.6 returns the values in the answer
+            rec.variables[item["key"]] = item.get("value")
+        csms.bus.changed()
+    csms.bus.note(station_id, f"{payload.__class__.__name__} → {_short(result)}")
     return {"ok": True, "result": result}
 
 

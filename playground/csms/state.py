@@ -9,11 +9,11 @@ from dataclasses import asdict, dataclass, field
 @dataclass
 class Policy:
     """CSMS behaviour that the dashboard can change. Every field is a PLAYGROUND DECISION, not an OCPP rule."""
-    versions: list = field(default_factory=lambda: ["2.1", "2.0.1"])   # enabled, in preference order
+    versions: list = field(default_factory=lambda: ["2.1", "2.0.1", "1.6"])   # enabled, in preference order
     registration_mode: str = "pending_then_accept"   # "accept" | "reject" | "pending_then_accept"
     heartbeat_interval: int = 10        # seconds, sent with Accepted
     retry_interval: int = 5             # seconds, sent with Pending / Rejected
-    unreadable_frames: str = "answer"   # "answer" with id "-1" | "drop"  (both allowed: Part 4 §4.2.3)
+    unreadable_frames: str = "answer"   # "answer" with id "-1" | "drop"  (both allowed: 2.x Part 4 §4.2.3)
     duplicate_ids: str = "reject"       # "reject" a reused message id | "allow"
     authorize_detail: str = "full"      # "full" status | "accepted_or_invalid" (hide Blocked/Expired)
     fault_bad_heartbeat_response: bool = False   # inject a schema-invalid HeartbeatResponse

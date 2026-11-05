@@ -1,12 +1,13 @@
-"""Simulated charging station (WebSocket client).
+"""Simulated charging station (WebSocket client), for OCPP 1.6, 2.0.1 and 2.1.
 
-Life cycle:
-  power on ─▶ connect (offers its subprotocols) ─▶ BootNotification until Accepted
-          ─▶ StatusNotification per connector ─▶ flush offline transaction queue
+Life cycle (identical for every version):
+  power on ─▶ connect, offering its subprotocols ─▶ BootNotification until Accepted
+          ─▶ StatusNotification per connector ─▶ flush the offline transaction queue
           ─▶ Heartbeat / meter values / (2.1) event streams, until the connection drops
-  connection lost ─▶ back-off with randomisation (Part 4 §5.3) ─▶ reconnect without a new
-          BootNotification ─▶ report connectors (B04: all if offline > OfflineThreshold, else changed ones)
+  connection lost ─▶ back-off with randomisation ─▶ reconnect without a new BootNotification
+          ─▶ report connectors (all if offline > OfflineThreshold, else only the changed ones)
 
+What the station *says* depends on the negotiated version: see behaviour.py (Behaviour2x / Behaviour16).
 Behaviour marked PLAYGROUND DECISION is a simplification, not an OCPP rule.
 """
 from __future__ import annotations
@@ -16,7 +17,7 @@ import json
 import random
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import websockets
 from ocpp.exceptions import OCPPError
@@ -25,8 +26,9 @@ from ..events import Bus
 from ..protocol import schemas
 from ..protocol.frames import FrameError, MessageType, error_frame, parse
 from ..protocol.versions import BY_SUBPROTOCOL, OcppVersion
+from .behaviour import behaviour_for
 from .handlers import station_class
-from .model import Evse, TxState, default_variables
+from .model import CONFIG_16, Evse, default_variables
 
 POWER_W = 11000          # simulated charging power
 
@@ -36,7 +38,7 @@ def now_iso(dt: datetime | None = None) -> str:
 
 
 class StationConnection:
-    """Thin wrapper around the client WebSocket: remembers received CALLERROR ids, intercepts 2.1 frames."""
+    """Client WebSocket wrapper: remembers received CALLERROR ids, intercepts 2.1 CALLRESULTERROR."""
 
     def __init__(self, ws, station: "Station"):
         self.ws, self.station = ws, station
@@ -52,9 +54,9 @@ class StationConnection:
             if frame.type is MessageType.CALLERROR:
                 self.received_errors.add(frame.message_id)
             if frame.type is MessageType.CALLRESULTERROR:
-                self.station.bus.note(self.station.id, f"Station got CALLRESULTERROR {frame.error_code} for one of its "
-                                                       "answers", "warn", "2.1 Part 4 §4.2.3")
-                continue          # the library doesn't know type 5
+                self.station.bus.note(self.station.id, f"Station got CALLRESULTERROR {frame.error_code}: the CSMS "
+                                                       "couldn't process one of its answers", "warn", "2.1 Part 4 §4.2.3")
+                continue
             return raw
 
     async def send(self, raw: str) -> None:
@@ -68,7 +70,9 @@ class Station:
         self.power = False
         self.network_up = True
         self.link = False
-        self.version: OcppVersion | None = None
+        # Until the first handshake, assume the preferred offered version (decides the vocabulary).
+        self.version: OcppVersion = BY_SUBPROTOCOL[self.offer[0]]
+        self.behaviour = behaviour_for(self.version, self)
         self.registration = "—"            # what the CSMS last told *us*
         self.need_boot = True
         self.boot_reason = "PowerUp"
@@ -78,33 +82,62 @@ class Station:
         self.activity = "switched off"
         self.attempt = 0
         self.offline_since: float | None = None
-        self.last_sent = 0.0               # G02.FR.05: any message resets the heartbeat timer
-        self.tx_queue: list[dict] = []     # TransactionEvents that happened while offline (E04/E12)
-        self.streams: dict[int, dict] = {} # 2.1 periodic event streams we opened
+        self.last_sent = 0.0               # any message resets the heartbeat timer (G02.FR.05 / 1.6 §4.6)
+        self.tx_queue: list = []           # (label, coroutine function) waiting for the connection
+        self.streams: dict[int, dict] = {} # 2.1 periodic event streams
         self.cp = None
         self.ws = None
         self._task: asyncio.Task | None = None
-        self._kick = asyncio.Event()       # skip the back-off wait (power on, reboot)
-        self._boot_now = asyncio.Event()   # TriggerMessage(BootNotification) while Pending (B02.FR.04)
+        self._kick = asyncio.Event()
+        self._boot_now = asyncio.Event()
         self._stream_ids = iter(range(1, 10_000))
+        for e in self.evses.values():
+            e.status = self.behaviour.status_of(e)
 
-    # ==================================================================== dashboard view
+    # ==================================================================== state for the dashboard
     def var(self, key: str):
         return self.variables[key][0]
+
+    def set_variable(self, key: str, value) -> str:
+        entry = self.variables.get(key)
+        if entry is None:
+            return "UnknownVariable"
+        if entry[1] != "ReadWrite":
+            return "Rejected"
+        try:
+            entry[0] = int(value) if isinstance(entry[0], int) else str(value)
+        except ValueError:
+            return "Rejected"
+        self.bus.changed()
+        return "Accepted"
+
+    def config_16(self, key: str):
+        """(value, readonly) of a 1.6 configuration key, or None if unknown."""
+        if key == "NumberOfConnectors":
+            return str(len(self.evses)), True
+        target = CONFIG_16.get(key)
+        if target is None:
+            return None
+        if isinstance(target, tuple):
+            return target[0], True
+        return str(self.var(target)), self.variables[target][1] != "ReadWrite"
+
+    @property
+    def accepted(self) -> bool:
+        return self.link and self.registration == "Accepted"
 
     def snapshot(self) -> dict:
         return {
             "power": self.power, "network_up": self.network_up, "link": self.link,
-            "version": self.version.name if self.version else None, "offer": list(self.offer),
-            "registration": self.registration, "boot_on_reconnect": self.boot_on_reconnect,
-            "activity": self.activity, "attempt": self.attempt, "queued": len(self.tx_queue),
-            "variables": {k: v[0] for k, v in self.variables.items()},
-            "streams": list(self.streams),
+            "version": self.version.name if self.link else None, "family": self.behaviour.family,
+            "offer": list(self.offer), "registration": self.registration, "boot_on_reconnect": self.boot_on_reconnect,
+            "activity": self.activity, "attempt": self.attempt, "queued": [label for label, _ in self.tx_queue],
+            "heartbeat": self.var("OCPPCommCtrlr.HeartbeatInterval"), "streams": list(self.streams),
             "evses": {str(i): {"status": e.status, "operative": e.operative, "cable": e.cable, "fault": e.fault,
-                               "tx": None if e.tx is None else {"id": e.tx.id, "token": e.tx.token,
+                               "auth_token": e.auth_token,
+                               "tx": None if e.tx is None else {"id": e.tx.shown_id, "token": e.tx.token,
                                                                 "charging": e.tx.charging,
-                                                                "energy_wh": round(e.tx.energy_wh, 1),
-                                                                "seq": e.tx.seq}}
+                                                                "energy_wh": round(e.tx.energy_wh, 1), "seq": e.tx.seq}}
                       for i, e in self.evses.items()},
         }
 
@@ -112,7 +145,7 @@ class Station:
         self.activity = activity
         self.bus.changed()
 
-    # ==================================================================== power & network buttons
+    # ==================================================================== power & network
     async def power_on(self) -> None:
         if self.power:
             return
@@ -125,9 +158,12 @@ class Station:
         await self._stop_task()
         for e in self.evses.values():
             if e.tx:
-                self.bus.note(self.id, f"Power lost during transaction {e.tx.id}: it's gone (simulator)")
+                self.bus.note(self.id, f"Power lost during transaction {e.tx.shown_id}: it's gone (simulator)")
                 e.tx = None
-        self.registration, self.version, self.streams = "—", None, {}
+            e.auth_token, e.finishing = None, False
+            e.status = self.behaviour.status_of(e)
+        self.tx_queue.clear()
+        self.registration, self.streams = "—", {}
         self._set("switched off")
 
     async def drop_network(self) -> None:
@@ -142,10 +178,10 @@ class Station:
         self.bus.note(self.id, "Network back: the next reconnect attempt (after its back-off) will succeed")
         self.bus.changed()
 
-    async def reboot(self, cp, reason: str) -> None:
+    async def reboot(self, reason: str, stop_reason: str | None = None) -> None:
         for e in self.evses.values():
             if e.tx:
-                await self.end_transaction(cp, e, "ResetCommand", "ImmediateReset")
+                await self.behaviour.reset_stop(e)
         self.need_boot, self.boot_reason, self.registration = True, reason, "—"
         self.attempt = 0
         self._kick.set()
@@ -163,9 +199,9 @@ class Station:
 
     # ==================================================================== connection life cycle
     def _backoff(self) -> float:
-        """Part 4 §5.3: minimum + random, doubled after each failure up to RepeatTimes, then constant."""
-        base = self.var("OCPPCommCtrlr.RetryBackOffWaitMinimum") * 2 ** min(self.attempt,
-                                                                           self.var("OCPPCommCtrlr.RetryBackOffRepeatTimes"))
+        """2.x Part 4 §5.3: minimum + random, doubled after each failure up to RepeatTimes."""
+        base = self.var("OCPPCommCtrlr.RetryBackOffWaitMinimum") * 2 ** min(
+            self.attempt, self.var("OCPPCommCtrlr.RetryBackOffRepeatTimes"))
         return base + random.uniform(0, self.var("OCPPCommCtrlr.RetryBackOffRandomRange"))
 
     async def _lifecycle(self) -> None:
@@ -181,9 +217,10 @@ class Station:
                 self.bus.note(self.id, f"Connect attempt {self.attempt + 1} failed: {e}", "warn")
             except websockets.ConnectionClosed:
                 pass
-            except Exception as e:                       # keep the simulator alive, show the problem
+            except Exception as e:
                 self.bus.note(self.id, f"Station error: {type(e).__name__}: {e}", "error")
             self.link, self.ws, self.cp = False, None, None
+            self.bus.changed()
             if not self.power:
                 break
             if self.offline_since is None:
@@ -207,13 +244,16 @@ class Station:
         async with websockets.connect(f"{self.url}/{self.id}", subprotocols=list(self.offer), open_timeout=5) as ws:
             version = BY_SUBPROTOCOL.get(ws.subprotocol or "")
             if version is None:
-                self.bus.note(self.id, f"Station offered {list(self.offer)}, the CSMS agreed on none → closed",
-                              "warn", "Part 4 §3.2")
+                self.bus.note(self.id, f"Station offered {list(self.offer)}, the CSMS agreed on none → closed", "warn",
+                              "§3.2")
                 await ws.wait_closed()
                 return False
-            self.version, self.ws, self.link = version, ws, True
-            cls = station_class(version)
-            cp = cls(self.id, StationConnection(ws, self), response_timeout=10)
+            if version is not self.version:
+                self.version, self.behaviour = version, behaviour_for(version, self)
+                for e in self.evses.values():
+                    e.status = self.behaviour.status_of(e)
+            self.ws, self.link = ws, True
+            cp = station_class(version)(self.id, StationConnection(ws, self), response_timeout=10)
             cp.station = self
             self.cp = cp
             self.bus.changed()
@@ -232,25 +272,25 @@ class Station:
         offline_for = time.time() - self.offline_since if self.offline_since else None
         self.offline_since = None
         if self.need_boot or self.registration != "Accepted" or self.boot_on_reconnect:
-            reason = self.boot_reason if self.need_boot else "Unknown"
-            await self._boot(cp, reason)
+            await self._boot(cp, self.boot_reason if self.need_boot else "Unknown")
             self.need_boot, self.boot_reason = False, "PowerUp"
-            await self.report_status(cp, list(self.evses.values()))          # B01.FR.05
+            await self.report(list(self.evses.values()), include_station=True, force=True)   # B01.FR.05
         else:
             self.bus.note(self.id, "Reconnected without a new BootNotification: boot data unchanged",
-                          ref="Part 4 §5.3")
+                          ref=self.version.ref("§5.4" if self.version.name == "1.6" else "§5.3"))
             threshold = self.var("OCPPCommCtrlr.OfflineThreshold")
-            if offline_for is not None and offline_for > threshold:
+            if self.version.is_2x and offline_for is not None and offline_for > threshold:
                 self.bus.note(self.id, f"Offline {offline_for:.0f} s > OfflineThreshold {threshold} s → report all "
                                        "connectors", ref="B04.FR.01")
-                await self.report_status(cp, list(self.evses.values()))
+                await self.report(list(self.evses.values()), force=True)
             else:
                 changed = [e for e in self.evses.values() if e.changed_while_offline]
-                self.bus.note(self.id, f"Offline {offline_for or 0:.0f} s ≤ OfflineThreshold → report only "
-                                       f"{len(changed)} changed connector(s)", ref="B04.FR.02")
-                await self.report_status(cp, changed)
+                ref = "1.6 §4.9" if self.version.name == "1.6" else "B04.FR.02"
+                self.bus.note(self.id, f"Offline {offline_for or 0:.0f} s → report the {len(changed)} connector(s) "
+                                       "whose status changed", ref=ref)
+                await self.report(changed, force=True)
         await self._flush_queue(cp)
-        await asyncio.gather(self._heartbeat_loop(cp), self._meter_loop(cp), self._stream_loop(cp))
+        await asyncio.gather(self._heartbeat_loop(cp), self._meter_loop(), self._stream_loop())
 
     # ==================================================================== sending helpers
     async def call(self, cp, payload, **kwargs):
@@ -260,19 +300,40 @@ class Station:
         try:
             return await cp.call(payload, suppress=False, unique_id=uid, **kwargs)
         except OCPPError as e:
+            name = payload.__class__.__name__
             if uid in cp._connection.received_errors:
-                self.bus.note(self.id, f"CSMS answered {payload.__class__.__name__} with CALLERROR {e.code}", "warn")
-            elif self.version and MessageType.CALLRESULTERROR in self.version.frame_types:
-                code = schemas.code_for_library_error(e)
+                self.bus.note(self.id, f"CSMS answered {name} with CALLERROR {e.code}", "warn")
+                return None
+            code = schemas.code_for_library_error(e, self.version)
+            if MessageType.CALLRESULTERROR in self.version.frame_types:
                 cause = str((e.details or {}).get("cause", e.description))[:255]
                 await cp._connection.send(error_frame(uid, code, cause, result_error=True).to_json())
-                self.bus.note(self.id, f"CSMS's answer to {payload.__class__.__name__} is schema-invalid → station "
-                                       f"sends CALLRESULTERROR {code}", "warn", "2.1 Part 4 §4.2.3")
+                self.bus.note(self.id, f"CSMS's answer to {name} is schema-invalid → station sends CALLRESULTERROR {code}",
+                              "warn", self.version.ref("§4.2.3"))
             else:
-                self.bus.note(self.id, f"CSMS's answer to {payload.__class__.__name__} is schema-invalid "
-                                       f"({schemas.code_for_library_error(e)}); OCPP 2.0.1 has no CALLRESULTERROR "
-                                       "to report it", "warn")
+                self.bus.note(self.id, f"CSMS's answer to {name} is schema-invalid ({code}); OCPP {self.version.name} "
+                                       "has no CALLRESULTERROR to report it", "warn")
             return None
+
+    async def send_tx(self, send, label: str, quiet: bool = False) -> None:
+        """Send a transaction-related message now, or queue it until connected and Accepted (E04/E12, 1.6 §3.5)."""
+        if self.accepted and self.cp:
+            await send(self.cp, False)
+        else:
+            self.tx_queue.append((label, send))
+            if not quiet:
+                self.bus.note(self.id, f"{label} queued (offline / not accepted): sent after the reconnect",
+                              ref="1.6 §3.5" if self.version.name == "1.6" else "E04 / E12")
+        self.bus.changed()
+
+    async def _flush_queue(self, cp) -> None:
+        # Remove a message only once it has been sent: if the connection drops mid-flush, it stays
+        # queued for the next reconnect (at-least-once delivery, like OCPP's transaction-message retries).
+        while self.tx_queue:
+            label, send = self.tx_queue[0]
+            await send(cp, True)
+            self.tx_queue.pop(0)
+            self.bus.changed()
 
     async def raw(self, text: str) -> None:
         if not self.ws:
@@ -280,46 +341,58 @@ class Station:
         self.last_sent = time.time()
         await self.ws.send(text)
 
+    async def authorize(self, token: str) -> str:
+        if not self.accepted:
+            # PLAYGROUND DECISION: accept unknown tokens while offline (configurable in real stations)
+            self.bus.note(self.id, f"Offline: card {token} accepted locally", "warn",
+                          "1.6 §3.5" if self.version.name == "1.6" else "C15")
+            return "Accepted"
+        resp = await self.call(self.cp, self.behaviour.authorize_payload(token))
+        status = self.behaviour.authorize_status(resp) if resp else "Invalid"
+        if status != "Accepted":
+            self.bus.note(self.id, f"Card {token}: {status} → no charging", "warn")
+        return status
+
     # ==================================================================== boot & reports
     async def _boot(self, cp, reason: str) -> None:
-        C = self.version.call
         while True:
             self._set("sending BootNotification")
-            resp = await self.call(cp, C.BootNotification(
-                charging_station={"model": self.var("ChargingStation.Model"),
-                                  "vendor_name": self.var("ChargingStation.VendorName"),
-                                  "firmware_version": "1.0.0"}, reason=reason))
+            resp = await self.call(cp, self.behaviour.boot_payload(reason))
             if resp is None:
                 wait = 10
             else:
                 self.registration = resp.status
                 self.bus.changed()
                 if resp.status == "Accepted":
-                    if resp.interval > 0:                          # B01.FR.04
+                    if resp.interval > 0:
                         self.variables["OCPPCommCtrlr.HeartbeatInterval"][0] = resp.interval
                     return
-                # B02.FR.07 / B03.FR.05: interval 0 → choose our own. PLAYGROUND DECISION: 10 s
-                wait = resp.interval if resp.interval > 0 else 10
+                wait = resp.interval if resp.interval > 0 else 10      # interval 0: choose our own (decision: 10 s)
             self._set(f"{self.registration}: next BootNotification in {wait} s")
-            try:                                                   # B02.FR.04: TriggerMessage may ask earlier
-                await asyncio.wait_for(self._boot_now.wait(), wait)
+            try:
+                await asyncio.wait_for(self._boot_now.wait(), wait)      # TriggerMessage may ask earlier
                 self._boot_now.clear()
                 reason = "Triggered"
             except asyncio.TimeoutError:
                 pass
 
-    async def report_status(self, cp, evses: list[Evse]) -> None:
-        if not (self.link and self.registration == "Accepted"):
-            for e in evses:
-                e.status = e.computed_status()
+    async def report(self, evses: list[Evse], include_station: bool = False, force: bool = False) -> None:
+        """Recompute statuses; send a StatusNotification for each one that changed (or all, with force)."""
+        to_send = []
+        for e in evses:
+            new = self.behaviour.status_of(e)
+            if force or new != e.status or e.changed_while_offline:
+                to_send.append(e)
+            e.status = new
+        if not self.accepted:
+            for e in to_send:
                 e.changed_while_offline = True
             self.bus.changed()
             return
-        for e in evses:
-            e.status = e.computed_status()
+        for payload in self.behaviour.status_payloads(to_send, include_station):
+            await self.call(self.cp, payload)
+        for e in to_send:
             e.changed_while_offline = False
-            await self.call(cp, self.version.call.StatusNotification(
-                timestamp=now_iso(), connector_status=e.status, evse_id=e.id, connector_id=1))
         self.bus.changed()
 
     async def send_report(self, cp, request_id: int) -> None:
@@ -328,169 +401,90 @@ class Station:
         await self.call(cp, self.version.call.NotifyReport(request_id=request_id, generated_at=now_iso(), seq_no=0,
                                                            report_data=data, tbc=False))
 
-    async def triggered(self, cp, message: str, evse_id: int | None) -> None:
+    async def triggered(self, message: str, evse_id: int | None) -> None:
+        C = self.version.call
         if message == "BootNotification":
             if self.registration == "Accepted":
-                await self._boot(cp, "Triggered")
+                await self._boot(self.cp, "Triggered")
             else:
                 self._boot_now.set()
         elif message == "Heartbeat":
-            await self.call(cp, self.version.call.Heartbeat())
+            await self.call(self.cp, C.Heartbeat())
         elif message == "StatusNotification":
             targets = [self.evses[evse_id]] if evse_id in self.evses else list(self.evses.values())
-            for e in targets:                    # a triggered report is allowed even if not Accepted
-                await self.call(cp, self.version.call.StatusNotification(
-                    timestamp=now_iso(), connector_status=e.computed_status(), evse_id=e.id, connector_id=1))
+            for payload in self.behaviour.status_payloads(targets):     # allowed even if not Accepted
+                await self.call(self.cp, payload)
+        elif message == "MeterValues":
+            for e in self.evses.values():
+                if e.tx:
+                    await self.behaviour.meter(e)
+
+    async def after_transaction(self, e: Evse) -> None:
+        if e.pending_operative is not None:                 # a "Scheduled" ChangeAvailability
+            e.operative, e.pending_operative = e.pending_operative, None
+            await self.report([e])
 
     # ==================================================================== periodic loops
     async def _heartbeat_loop(self, cp) -> None:
         while True:
             interval = self.var("OCPPCommCtrlr.HeartbeatInterval")
             self._set(f"{self.registration} · OCPP {self.version.name} · Heartbeat every {interval} s")
-            due = self.last_sent + interval
-            await asyncio.sleep(max(0.2, min(1.0, due - time.time())))
+            await asyncio.sleep(max(0.2, min(1.0, self.last_sent + interval - time.time())))
             if time.time() >= self.last_sent + self.var("OCPPCommCtrlr.HeartbeatInterval"):
                 await self.call(cp, self.version.call.Heartbeat())
 
-    async def _meter_loop(self, cp) -> None:
-        last_sent: dict[int, float] = {}
+    async def _meter_loop(self) -> None:
+        last: dict[int, float] = {}
         while True:
             await asyncio.sleep(1)
             for e in self.evses.values():
                 if e.tx and e.tx.charging:
                     e.tx.energy_wh += POWER_W / 3600
-                    if time.time() - last_sent.get(e.id, 0) >= self.var("SampledDataCtrlr.TxUpdatedInterval"):
-                        last_sent[e.id] = time.time()
-                        await self._tx_event(cp, e, "Updated", "MeterValuePeriodic", "Charging")
+                    if time.time() - last.get(e.id, 0) >= self.var("SampledDataCtrlr.TxUpdatedInterval"):
+                        last[e.id] = time.time()
+                        await self.behaviour.meter(e)
             self.bus.changed()
 
-    async def _stream_loop(self, cp) -> None:
+    async def _stream_loop(self) -> None:
         while True:
             await asyncio.sleep(1)
             for sid, s in list(self.streams.items()):
                 s["buffer"].append((time.time(), f"{230 + random.uniform(-2.5, 2.5):.1f}"))
                 if len(s["buffer"]) >= s["values"]:
                     base = s["buffer"][0][0]
-                    payload = {"id": sid, "pending": 0,
-                               "basetime": now_iso(datetime.fromtimestamp(base, timezone.utc)),
+                    payload = {"id": sid, "pending": 0, "basetime": now_iso(datetime.fromtimestamp(base, timezone.utc)),
                                "data": [{"t": round(t - base, 3), "v": v} for t, v in s["buffer"]]}
                     s["buffer"].clear()
-                    # SEND (2.1): no answer expected, may be sent while a CALL is open (2.1 Part 4 §4.1.1 note)
                     await self.raw(json.dumps([6, str(uuid.uuid4()), "NotifyPeriodicEventStream", payload]))
 
-    # ==================================================================== transactions (E02/E03/E07/E09)
-    async def _tx_event(self, cp, evse: Evse, event_type: str, trigger: str, charging_state: str,
-                        token: str | None = None, stopped_reason: str | None = None) -> None:
-        tx = evse.tx
-        info = {"transaction_id": tx.id, "charging_state": charging_state}
-        if stopped_reason:
-            info["stopped_reason"] = stopped_reason
-        if tx.remote_start_id is not None and trigger == "RemoteStart":
-            info["remote_start_id"] = tx.remote_start_id          # links the event to RequestStartTransaction
-        kwargs = dict(event_type=event_type, timestamp=now_iso(), trigger_reason=trigger, seq_no=tx.next_seq(),
-                      transaction_info=info, evse={"id": evse.id, "connector_id": 1},
-                      meter_value=[{"timestamp": now_iso(), "sampled_value": [{
-                          "value": round(tx.energy_wh, 1), "measurand": "Energy.Active.Import.Register",
-                          "unit_of_measure": {"unit": "Wh"}}]}])
-        if token:
-            kwargs["id_token"] = {"id_token": token, "type": "ISO14443"}
-        if not (self.link and self.registration == "Accepted" and cp):
-            kwargs["offline"] = True                                 # E04: happened while offline
-            self.tx_queue.append(kwargs)
-            self.bus.note(self.id, f"TransactionEvent {event_type} queued (offline), will be sent later",
-                          ref="E04 / E12")
-            self.bus.changed()
-            return
-        resp = await self.call(cp, self.version.call.TransactionEvent(**kwargs))
-        if resp is not None and resp.id_token_info and resp.id_token_info.get("status") not in (None, "Accepted"):
-            self.bus.note(self.id, f"CSMS says token {token} is {resp.id_token_info['status']}", "warn")
-        self.bus.changed()
-
-    async def _flush_queue(self, cp) -> None:
-        while self.tx_queue:
-            kwargs = self.tx_queue.pop(0)
-            await self.call(cp, self.version.call.TransactionEvent(**kwargs))
-        self.bus.changed()
-
-    async def authorize(self, cp, token: str) -> str:
-        if not (self.link and self.registration == "Accepted"):
-            # PLAYGROUND DECISION: accept unknown tokens while offline (C15 makes this configurable)
-            self.bus.note(self.id, f"Offline: token {token} accepted locally", "warn", "C15")
-            return "Accepted"
-        resp = await self.call(cp, self.version.call.Authorize(id_token={"id_token": token, "type": "ISO14443"}))
-        return resp.id_token_info["status"] if resp else "Invalid"
-
+    # ==================================================================== buttons on the station card
     async def plug(self, evse_id: int) -> None:
-        cp, e = self.cp, self.evses[evse_id]
+        e = self.evses[evse_id]
         if e.cable or e.fault or not e.operative:
-            self.bus.note(self.id, f"EVSE {evse_id}: can't plug in now ({e.computed_status()})", "warn")
+            self.bus.note(self.id, f"Connector {evse_id}: can't plug in now ({e.status})", "warn")
             return
         e.cable = True
-        await self.report_status(cp, [e])
-        if e.tx is None:                                         # E02: cable first
-            e.tx = TxState()
-            await self._tx_event(cp, e, "Started", "CablePluggedIn", "EVConnected")
-        else:                                                    # remote start / token came first
-            e.tx.charging = bool(e.tx.token)
-            await self._tx_event(cp, e, "Updated", "CablePluggedIn", "Charging" if e.tx.charging else "EVConnected")
-
-    async def present_token(self, evse_id: int, token: str) -> None:
-        cp, e = self.cp, self.evses[evse_id]
-        if e.tx and e.tx.token and e.tx.token == token:          # E07: same token again → stop
-            await self.end_transaction(cp, e, "StopAuthorized", "Local", token=token)
-            return
-        if e.tx and e.tx.token:
-            self.bus.note(self.id, f"EVSE {evse_id}: another token is charging here", "warn")
-            return
-        status = await self.authorize(cp, token)
-        if status != "Accepted":
-            self.bus.note(self.id, f"Token {token}: {status} → no charging", "warn", "C01")
-            return
-        if e.tx is None:                                         # E03: token first, wait for the cable
-            e.tx = TxState(token=token)
-            await self._tx_event(cp, e, "Started", "Authorized", "Idle", token=token)
-        else:
-            e.tx.token, e.tx.charging = token, True
-            await self._tx_event(cp, e, "Updated", "Authorized", "Charging", token=token)
-
-    async def remote_start(self, cp, e: Evse, token: str, remote_start_id: int) -> None:
-        if e.tx is None:                                         # F02: remote start first
-            e.tx = TxState(token=token, remote_start_id=remote_start_id)
-            await self._tx_event(cp, e, "Started", "RemoteStart", "Idle", token=token)
-        else:                                                    # F01: cable already plugged
-            e.tx.token, e.tx.charging, e.tx.remote_start_id = token, True, remote_start_id
-            await self._tx_event(cp, e, "Updated", "RemoteStart", "Charging", token=token)
-
-    async def end_transaction(self, cp, e: Evse, trigger: str, reason: str, token: str | None = None) -> None:
-        if e.tx is None:
-            return
-        e.tx.charging = False
-        await self._tx_event(cp, e, "Ended", trigger, "EVConnected" if e.cable else "Idle", token=token,
-                             stopped_reason=reason)
-        e.tx = None
-        if e.pending_operative is not None:                      # Scheduled ChangeAvailability
-            e.operative, e.pending_operative = e.pending_operative, None
-            await self.report_status(cp, [e])
+        await self.behaviour.plug(e)
 
     async def unplug(self, evse_id: int) -> None:
-        cp, e = self.cp, self.evses[evse_id]
-        if not e.cable:
-            return
-        if e.tx:                                                 # E09: cable unplugged on EV side → stop
-            await self.end_transaction(cp, e, "EVCommunicationLost", "EVDisconnected")
-        e.cable = False
-        await self.report_status(cp, [e])
+        e = self.evses[evse_id]
+        if e.cable:
+            e.cable = False
+            await self.behaviour.unplug(e)
+
+    async def present_token(self, evse_id: int, token: str) -> None:
+        await self.behaviour.token(self.evses[evse_id], token)
 
     async def set_fault(self, evse_id: int, fault: bool) -> None:
-        cp, e = self.cp, self.evses[evse_id]
+        e = self.evses[evse_id]
         e.fault = fault
-        if fault and e.tx:
-            await self.end_transaction(cp, e, "AbnormalCondition", "Other")
-        await self.report_status(cp, [e])
+        if fault:
+            await self.behaviour.fault(e)
+        else:
+            await self.report([e])
 
-    # ==================================================================== 2.1 event streams (N11/N12)
     async def open_stream(self) -> None:
-        if not self.version or self.version.name != "2.1":
+        if not self.link or self.version.name != "2.1":
             self.bus.note(self.id, "Periodic event streams only exist in OCPP 2.1", "warn")
             return
         sid = next(self._stream_ids)
@@ -507,14 +501,15 @@ class Station:
         self.bus.changed()
 
     # ==================================================================== deliberate protocol mistakes
-    async def edge_case(self, name: str) -> None:
-        uid = str(uuid.uuid4())
-        frames = {
+    def edge_frames(self, uid: str) -> dict:
+        v16 = self.version.name == "1.6"
+        status_ok = ({"connectorId": 1, "errorCode": "NoError", "status": "Available"} if v16 else
+                     {"timestamp": now_iso(), "connectorStatus": "Available", "evseId": 1, "connectorId": 1})
+        return {
             "heartbeat_now": [2, uid, "Heartbeat", {}],
             "unknown_action": [2, uid, "MakeCoffee", {}],
-            "unsupported_action": [2, uid, "SecurityEventNotification",
-                                   {"type": "SettingSystemTime", "timestamp": now_iso()}],
-            "duplicate_id": None,
+            "unsupported_action": ([2, uid, "SignCertificate", {"csr": "x"}] if v16 else
+                                   [2, uid, "SecurityEventNotification", {"type": "SettingSystemTime", "timestamp": now_iso()}]),
             "malformed": '[2, "broken-1", "Heartbeat", {',
             "unreadable_id": [2, 12345, "Heartbeat", {}],
             "long_id": [2, "x" * 40, "Heartbeat", {}],
@@ -522,16 +517,20 @@ class Station:
             "send_frame": [6, uid, "NotifyPeriodicEventStream",
                            {"id": 999, "pending": 0, "basetime": now_iso(), "data": [{"t": 0, "v": "230.0"}]}],
             "invalid_payload": [2, uid, "StatusNotification",
-                                {"timestamp": now_iso(), "connectorStatus": "Exploded", "evseId": 1, "connectorId": 1}],
-            "missing_field": [2, uid, "BootNotification", {"reason": "PowerUp", "chargingStation": {"vendorName": "x"}}],
-            "wrong_type": [2, uid, "StatusNotification",
-                           {"timestamp": now_iso(), "connectorStatus": "Available", "evseId": "1", "connectorId": 1}],
+                                {**status_ok, ("status" if v16 else "connectorStatus"): "Exploded"}],
+            "missing_field": [2, uid, "BootNotification", {"chargePointVendor": "x"} if v16 else
+                              {"reason": "PowerUp", "chargingStation": {"vendorName": "x"}}],
+            "wrong_type": [2, uid, "StatusNotification", {**status_ok, "connectorId": "1"}],
         }
-        if name not in frames:
-            raise ValueError(f"unknown edge case {name}")
+
+    async def edge_case(self, name: str) -> None:
+        uid = str(uuid.uuid4())
         if name == "duplicate_id":
             await self.raw(json.dumps([2, uid, "Heartbeat", {}]))
             await self.raw(json.dumps([2, uid, "Heartbeat", {}]))
             return
+        frames = self.edge_frames(uid)
+        if name not in frames:
+            raise ValueError(f"unknown edge case {name}")
         frame = frames[name]
         await self.raw(frame if isinstance(frame, str) else json.dumps(frame))

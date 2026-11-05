@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ocpp-playground"
-version = "0.2.0"
-description = "Mini CSMS, simulated charging stations and a live sequence-diagram dashboard for OCPP 2.0.1 and 2.1"
+version = "0.3.0"
+description = "Mini CSMS, simulated charging stations and a live, picture-based dashboard for OCPP 1.6, 2.0.1 and 2.1"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["ocpp>=2.1,<3", "websockets>=14", "jsonschema>=4"]

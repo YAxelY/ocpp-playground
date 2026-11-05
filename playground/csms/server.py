@@ -83,7 +83,7 @@ class Csms:
         if version is None:
             self.bus.note(station_id, f"Handshake: station offered [{offered or 'nothing'}], CSMS has "
                                       f"{self.policy.versions} enabled → no common version, connection closed",
-                          "warn", "Part 4 §3.2")
+                          "warn", "§3.2 (1.6 OCPP-J and 2.x Part 4)")
             await ws.close(1002, "no supported OCPP version")
             return
         if station_id in self.connections:
@@ -94,7 +94,8 @@ class Csms:
         rec = self.stations.setdefault(station_id, StationRecord(id=station_id))
         rec.version, rec.online = version.name, True
         rec.seen()
-        rec.seen_ids.clear()
+        if not version.ids_unique_per_identity:     # 1.6 J §4.1.4: unique per connection only
+            rec.seen_ids.clear()
         cls = csms_class(version)
         handled = handled_actions(cls) & schemas.store(version).request_actions
         conn = GuardedConnection(ws, rec, version, self, handled)
@@ -102,7 +103,7 @@ class Csms:
         cp.csms, cp.rec, cp.version = self, rec, version
         self.connections[station_id] = cp
         self.bus.note(station_id, f"WebSocket open, OCPP {version.name} agreed (offered: {offered}) → Online",
-                      ref="Part 4 §3")
+                      ref=version.ref("§3"))
         self.bus.changed()
         try:
             await cp.start()

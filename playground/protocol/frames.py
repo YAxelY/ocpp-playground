@@ -67,7 +67,8 @@ class Frame:
 class FrameError(Exception):
     """A text that can't be turned into a valid `Frame`.
 
-    `code` is the RPC Framework error code that best describes the problem.
+    `code` is a *logical* error name ("rpc", "protocol", "unknown_type"); `OcppVersion.code()` turns
+    it into the string the negotiated version uses (e.g. RpcFrameworkError in 2.x, GenericError in 1.6).
     `message_id` is None when the id itself couldn't be read (then "-1" is used in a reply).
     `type_id` is the MessageTypeId if it could be read (useful to decide how to react).
     """
@@ -82,40 +83,40 @@ def parse(raw: str) -> Frame:
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError, ValueError):
-        raise FrameError("RpcFrameworkError", "frame is not valid JSON")
+        raise FrameError("rpc", "frame is not valid JSON")
     if not isinstance(data, list) or not data:
-        raise FrameError("RpcFrameworkError", "frame is not a non-empty JSON array")
+        raise FrameError("rpc", "frame is not a non-empty JSON array")
 
     type_id = data[0]
     message_id = data[1] if len(data) > 1 and isinstance(data[1], str) else None
     if message_id is None:
-        raise FrameError("RpcFrameworkError", "MessageId could not be read", None, type_id)
+        raise FrameError("rpc", "MessageId could not be read", None, type_id)
     if not message_id or len(message_id) > MAX_MESSAGE_ID_LENGTH:
-        raise FrameError("RpcFrameworkError", f"MessageId must be 1..{MAX_MESSAGE_ID_LENGTH} characters", message_id, type_id)
+        raise FrameError("rpc", f"MessageId must be 1..{MAX_MESSAGE_ID_LENGTH} characters", message_id, type_id)
 
     if not isinstance(type_id, int) or isinstance(type_id, bool) or type_id not in MessageType._value2member_map_:
-        raise FrameError("MessageTypeNotSupported", f"MessageTypeId {type_id!r} is unknown", message_id, type_id)
+        raise FrameError("unknown_type", f"MessageTypeId {type_id!r} is unknown", message_id, type_id)
     mtype = MessageType(type_id)
 
     if len(data) != _LENGTH[mtype]:
-        raise FrameError("ProtocolError", f"{mtype.name} must have {_LENGTH[mtype]} elements, got {len(data)}", message_id, type_id)
+        raise FrameError("protocol", f"{mtype.name} must have {_LENGTH[mtype]} elements, got {len(data)}", message_id, type_id)
 
     if mtype in (MessageType.CALL, MessageType.SEND):
         action, payload = data[2], data[3]
         if not isinstance(action, str) or not action:
-            raise FrameError("ProtocolError", "Action must be a non-empty string", message_id, type_id)
+            raise FrameError("protocol", "Action must be a non-empty string", message_id, type_id)
         if not isinstance(payload, dict):
-            raise FrameError("ProtocolError", "payload must be a JSON object", message_id, type_id)
+            raise FrameError("protocol", "payload must be a JSON object", message_id, type_id)
         return Frame(mtype, message_id, action=action, payload=payload)
 
     if mtype is MessageType.CALLRESULT:
         if not isinstance(data[2], dict):
-            raise FrameError("ProtocolError", "payload must be a JSON object", message_id, type_id)
+            raise FrameError("protocol", "payload must be a JSON object", message_id, type_id)
         return Frame(mtype, message_id, payload=data[2])
 
     code, description, details = data[2], data[3], data[4]
     if not isinstance(code, str) or not isinstance(description, str) or not isinstance(details, dict):
-        raise FrameError("ProtocolError", "error frame needs (string, string, object)", message_id, type_id)
+        raise FrameError("protocol", "error frame needs (string, string, object)", message_id, type_id)
     return Frame(mtype, message_id, error_code=code, error_description=description, error_details=details)
 
 
@@ -136,7 +137,7 @@ def peek(raw: str) -> dict:
                 {"errorCode": frame.error_code, "description": frame.error_description}}
     except FrameError as e:
         kind = "INVALID"
-        if e.code == "MessageTypeNotSupported":
+        if e.code == "unknown_type":
             kind = f"TYPE {e.type_id}"
         return {"kind": kind, "uid": e.message_id or "?", "action": None, "error_code": None,
                 "payload": None, "problem": e.description}

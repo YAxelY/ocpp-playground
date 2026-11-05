@@ -111,6 +111,54 @@ Other start and stop paths in the simulator:
 | Reset while charging | `Ended` with ResetCommand, stoppedReason ImmediateReset | B12 |
 | Pending station receives RequestStartTransaction | answers `Rejected` | B02.FR.05 |
 
+## 4b. The same session in OCPP 1.6 (1.6 §4.1, §4.7–4.10)
+
+In 1.6 a session is three different messages, the **CSMS** assigns the transaction id, and the connector goes through
+more statuses (1.6 §4.9: *Occupied* was split into Preparing, Charging, SuspendedEV/EVSE and Finishing).
+
+```mermaid
+sequenceDiagram
+    participant EV as Driver / EV
+    participant CP as Charge point (1.6)
+    participant CSMS
+    EV->>CP: plug in cable
+    CP->>CSMS: StatusNotification connector 1 · Preparing · errorCode NoError
+    EV->>CP: present card AXEL-0001
+    CP->>CSMS: Authorize (idTag)
+    CSMS-->>CP: idTagInfo Accepted
+    CP->>CSMS: StartTransaction (connectorId 1, idTag, meterStart, timestamp)
+    CSMS-->>CP: transactionId 1001 + idTagInfo
+    Note over CSMS: the CSMS chose the id (1.6 §4.8)
+    CP->>CSMS: StatusNotification · Charging
+    loop every MeterValueSampleInterval
+        CP->>CSMS: MeterValues (connectorId 1, transactionId 1001)
+    end
+    EV->>CP: same card again
+    CP->>CSMS: StopTransaction (transactionId 1001, meterStop, reason Local)
+    CP->>CSMS: StatusNotification · Finishing
+    EV->>CP: unplug
+    CP->>CSMS: StatusNotification · Available
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Available
+    Available --> Preparing: cable in, or card / RemoteStart first
+    Preparing --> Charging: authorized + cable → StartTransaction
+    Charging --> Finishing: StopTransaction (card, RemoteStop)
+    Charging --> Available: cable pulled → StopTransaction EVDisconnected
+    Finishing --> Available: cable out
+    Preparing --> Available: cable out / card withdrawn
+    Available --> Unavailable: ChangeAvailability Inoperative
+    Unavailable --> Available: ChangeAvailability Operative
+    Charging --> Faulted: fault → StopTransaction Other
+    Faulted --> Available: repaired
+```
+
+At boot a 1.6 charge point also reports **connectorId 0** (the charge point itself, 1.6 §3.8), so the CSMS sees
+connectors `0`, `1`, `2`… A transaction started while offline is queued; its id only exists once the queued
+StartTransaction reaches the CSMS after the reconnect.
+
 ## 5. Connection loss, back-off and offline behaviour (Part 4 §5.3, B04, E04/E12)
 
 ```mermaid
@@ -171,6 +219,20 @@ sequenceDiagram
 ```
 
 ## 8. CSMS → station requests
+
+The dashboard buttons are generic; each one sends the message of the negotiated version:
+
+| Button | 2.0.1 / 2.1 | 1.6 |
+|---|---|---|
+| read heartbeat | GetVariables(OCPPCommCtrlr.HeartbeatInterval) | GetConfiguration(HeartbeatInterval) |
+| set heartbeat | SetVariables | ChangeConfiguration |
+| full report | GetBaseReport → NotifyReport later | GetConfiguration() → values in the answer |
+| reset | Reset(Immediate) | Reset(Soft) |
+| change availability | ChangeAvailability(operationalStatus, evse) | ChangeAvailability(connectorId, type) |
+| remote start / stop | RequestStart/StopTransaction | RemoteStart/StopTransaction (not sent while Pending, 1.6 §4.2) |
+| unlock | UnlockConnector(evseId, connectorId) | UnlockConnector(connectorId) |
+
+2.x details:
 
 | Dashboard button | Request | Station behaviour |
 |---|---|---|
