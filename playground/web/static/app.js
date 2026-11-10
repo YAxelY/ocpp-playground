@@ -84,15 +84,29 @@ function renderPolicy() {
   captureUi(box);
   const sel = (key, opts) => `<select data-pol="${key}">${opts.map(([v, t]) => `<option value="${v}" ${p[key] === v ? "selected" : ""}>${t}</option>`).join("")}</select>`;
   const online = state.stations.filter((s) => s.csms?.online).length;
+  const pendingMode = p.registration_mode.startsWith("pending_then");
   box.innerHTML = `
-    <h2>🖥️ CSMS <span class="sub">${online} station(s) connected · ws://${esc(location.hostname)}:9000/ocpp/&lt;id&gt;</span></h2>
+    <h2>🖥️ CSMS <span class="sub">${online} station(s) connected · ${esc(meta.csms_url || "ws://…/ocpp")}/&lt;id&gt;</span></h2>
     <div class="row"><span class="lbl">speaks</span>
       ${["2.1", "2.0.1", "1.6"].map((v) => `<label><input type="checkbox" data-ver="${v}" ${p.versions.includes(v) ? "checked" : ""}> ${badge(`ver ${vclass(v)}`, v)}</label>`).join(" ")}
       <span class="sub">preference ${esc(p.versions.join(" > ")) || "none: every station is refused"}</span></div>
+    <div class="reg">
+      <div class="row"><span class="lbl">Answer to BootNotification</span>${sel("registration_mode", [
+        ["pending_then_accept", "⏳ Pending, then ✔ Accepted"], ["pending_then_reject", "⏳ Pending, then ✖ Rejected"],
+        ["pending", "⏳ Pending, forever"], ["accept", "✔ Accepted at once"], ["reject", "✖ Rejected at once"]])}
+        ${ref("1.6 §4.2 · B01 / B02 / B03")}</div>
+      ${pendingMode ? `<div class="row"><span class="lbl">Pending lasts</span><input type="number" min="0" data-pol="pending_for" value="${p.pending_for}"> s
+        <span class="sub">counted from the station's first Pending answer; then the final answer</span></div>` : ""}
+      <div class="row"><span class="lbl">Interval with Accepted</span><input type="number" min="1" data-pol="heartbeat_interval" value="${p.heartbeat_interval}"> s
+        <span class="sub">= the heartbeat interval</span> ${ref("B01.FR.04 · G02.FR.01")}</div>
+      <div class="row"><span class="lbl">Interval with Pending / Rejected</span><input type="number" min="0" data-pol="retry_interval" value="${p.retry_interval}"> s
+        <span class="sub">= next BootNotification not before (0: the station chooses)</span> ${ref("B02.FR.04/07/08 · B03.FR.05/06")}</div>
+      ${p.registration_mode !== "accept" && p.registration_mode !== "reject" ? `<div class="row"><span class="lbl">While Pending the CSMS</span>
+        ${PENDING_ACTIONS.filter(([k]) => k !== "trigger_boot" || pendingMode).map(([k, label]) => `<label><input type="checkbox" data-pa="${k}" ${p.pending_actions.includes(k) ? "checked" : ""}> ${label}</label>`).join(" ")}
+        · first after <input type="number" min="0" data-pol="pending_action_delay" value="${p.pending_action_delay}"> s ${ref("B02.FR.01 · 1.6 §4.2")}</div>` : ""}
+      <div class="row sub">A station that already got its final answer keeps it: press <b>Forget registrations</b> to see Pending again.</div>
+    </div>
     <details data-key="policy"><summary>CSMS behaviour (playground choices, not OCPP rules)</summary>
-      <div class="row"><span class="lbl">BootNotification answer</span>${sel("registration_mode", [["pending_then_accept", "⏳ Pending first, then ✔ Accepted"], ["accept", "✔ Accepted"], ["reject", "✖ Rejected"]])}</div>
-      <div class="row"><span class="lbl">Intervals (s)</span> heartbeat <input type="number" min="1" data-pol="heartbeat_interval" value="${p.heartbeat_interval}">
-        retry <input type="number" min="0" data-pol="retry_interval" value="${p.retry_interval}"></div>
       <div class="row"><span class="lbl">Unreadable frame</span>${sel("unreadable_frames", [["answer", "answer with id \"-1\""], ["drop", "drop silently"]])}</div>
       <div class="row"><span class="lbl">Reused message id</span>${sel("duplicate_ids", [["reject", "refuse it"], ["allow", "answer normally"]])}</div>
       <div class="row"><span class="lbl">Card check detail</span>${sel("authorize_detail", [["full", "full status (Blocked, Expired…)"], ["accepted_or_invalid", "only Accepted / Invalid"]])}</div>
@@ -100,13 +114,59 @@ function renderPolicy() {
         broken Heartbeat answer (no currentTime)</label></div>
       <div class="row"><span class="lbl">Cards known</span><span class="mono">${Object.entries(p.tokens).map(([k, v]) => `💳 ${esc(k)}=${esc(v)}`).join(" · ")}</span></div>
       <div class="row"><button id="forget">Forget registrations</button></div>
+    </details>
+    <details data-key="policy-opt"><summary>⚙️ Optional CSMS behaviour (allowed by OCPP, not required)</summary>
+      <div class="row"><span class="lbl">After Accepted</span><label><input type="checkbox" data-pol="report_after_accept" ${p.report_after_accept ? "checked" : ""}>
+        ask for a full report (GetBaseReport / GetConfiguration)</label> ${ref("B07 · 1.6 §5.8")}</div>
+      <div class="row"><span class="lbl">Card answers</span>cache expiry <input type="number" min="0" data-pol="cache_expiry_minutes" value="${p.cache_expiry_minutes}"> min (0 = not sent)
+        ${ref("C10 cacheExpiryDateTime · 1.6 idTagInfo.expiryDate")}</div>
     </details>`;
   restoreUi(box);
   $$("[data-pol]", box).forEach((el) => (el.onchange = () =>
     send({ cmd: "policy", [el.dataset.pol]: el.type === "checkbox" ? el.checked : el.type === "number" ? +el.value : el.value })));
   $$("[data-ver]", box).forEach((el) => (el.onchange = () =>
     send({ cmd: "policy", versions: ["2.1", "2.0.1", "1.6"].filter((v) => $(`[data-ver="${v}"]`, box).checked) })));
+  $$("[data-pa]", box).forEach((el) => (el.onchange = () =>
+    send({ cmd: "policy", pending_actions: PENDING_ACTIONS.map(([k]) => k).filter((k) => $(`[data-pa="${k}"]`, box)?.checked) })));
   $("#forget", box).onclick = () => send({ cmd: "forget" });
+}
+const PENDING_ACTIONS = [
+  ["get_variables", "reads some settings (GetVariables · 1.6 GetConfiguration)"],
+  ["get_base_report", "asks for the full report (GetBaseReport · 1.6 GetConfiguration)"],
+  ["set_variables", "sets the heartbeat (SetVariables · 1.6 ChangeConfiguration)"],
+  ["trigger_boot", "when the time is up, asks for a new BootNotification (TriggerMessage)"],
+];
+
+// ======================================================================= optional behaviour
+const ref = (r) => (r ? `<span class="ref" title="specification reference">${esc(r)}</span>` : "");
+function optionControl(id, o, value) {
+  const on = (v) => `act('${id}','set_option',{key:'${o.key}',value:${v}})`;
+  if (o.kind === "bool") return `<input type="checkbox" ${value ? "checked" : ""} onchange="${on("this.checked")}">`;
+  if (o.kind === "int") return `<input type="number" value="${esc(value)}" onchange="${on("this.value")}">`;
+  if (o.kind === "choice") return `<select onchange="${on("this.value")}">${o.choices.map((c) =>
+    `<option value="${esc(c)}" ${c === value ? "selected" : ""}>${esc(o.labels[c] || c)}</option>`).join("")}</select>`;
+  const set = new Set(String(value).split(","));          // members: one checkbox per allowed value
+  return `<span class="members" data-opt="${id}|${o.key}">${o.choices.map((c) =>
+    `<label><input type="checkbox" value="${esc(c)}" ${set.has(c) ? "checked" : ""} onchange="setMembers(this)"> ${esc(c)}</label>`).join(" ")}</span>`;
+}
+function setMembers(box) {
+  const wrap = box.closest(".members"), [id, key] = wrap.dataset.opt.split("|");
+  const value = $$("input:checked", wrap).map((i) => i.value).join(",");
+  if (value) act(id, "set_option", { key, value }); else box.checked = true;     // at least one member
+}
+function optionsHtml(id, s) {
+  const v = vname(s), opts = (meta.options || []).filter((o) => o.versions.includes(v));
+  const groups = [...new Set(opts.map((o) => o.group))];
+  const where = (o) => v === "1.6" ? (o.key16 ? `1.6 key <code>${esc(o.key16)}</code>` : "implementation choice")
+                                   : (o.dm ? `variable <code>${esc(o.key)}</code>` : "implementation choice");
+  return `<details data-key="${id}-opt"><summary>⚙️ Optional behaviour of this station (OCPP ${esc(v)})</summary>
+    <p class="sub">Everything here is allowed by the specification. A variable / configuration key can also be changed by the CSMS
+      (${v === "1.6" ? "ChangeConfiguration" : "SetVariables"}); an implementation choice only from this panel.</p>
+    ${groups.map((g) => `<h3>${esc(g)}</h3>${opts.filter((o) => o.group === g).map((o) => `
+      <div class="opt"><div><b>${esc(o.label)}</b> ${optionControl(id, o, s.options[o.key])}</div>
+        <div class="sub">${esc(o.help)}</div>
+        <div class="sub">${where(o)} · ${ref(v === "1.6" ? o.ref16 : o.ref2x)}</div></div>`).join("")}`).join("")}
+  </details>`;
 }
 
 // ======================================================================= station picture (SVG)
@@ -177,6 +237,8 @@ function connectorHtml(id, s, no, e) {
       <button ${!e.cable ? "disabled" : ""} onclick="act('${id}','unplug',{evse:${no}})">⏏ Unplug</button>
       <select data-val="${k}-tok" aria-label="card">${TOKENS.map((t) => `<option>${t}</option>`).join("")}</select>
       <button onclick="act('${id}','token',{evse:${no},token:val('${k}-tok','AXEL-0001')})">💳 Present card</button>
+      ${e.ev_suspended ? `<button ${!e.cable ? "disabled" : ""} onclick="act('${id}','ev_resume',{evse:${no}})">▶ Car resumes</button>`
+                       : `<button ${!e.cable ? "disabled" : ""} title="the car stops drawing energy (SuspendedEV)" onclick="act('${id}','ev_pause',{evse:${no}})">⏸ Car pauses</button>`}
       ${e.fault ? `<button onclick="act('${id}','clear_fault',{evse:${no}})">🔧 Repair</button>`
                 : `<button onclick="act('${id}','fault',{evse:${no}})">⚠️ Fault</button>`}
     </div></div>`;
@@ -208,16 +270,22 @@ function stationHtml({ id, station: s, csms: c }) {
     ${v === "2.1" ? `<div class="row"><span class="lbl">2.1 stream</span>
       <button ${!accepted ? "disabled" : ""} onclick="act('${id}','open_stream')">📈 Open voltage stream</button>
       <button ${!s.streams.length ? "disabled" : ""} onclick="act('${id}','close_stream')">Close</button></div>${streams}` : ""}
+    ${optionsHtml(id, s)}
     <details data-key="${id}-views"><summary>👁️ What each side believes</summary><div class="views">
       <div class="view"><h3>🔌 Station thinks</h3><div class="kv">
         <span>Registration</span><span>${regBadge(s.registration)}</span>
         <span>Link</span><span>${live ? badge("ok", "▲ connected") : badge("idle", "✖ not connected")}</span>
         <span>Heartbeat</span><span>every ${s.heartbeat} s</span>
-        <span>Queued</span><span>${s.queued.length ? esc(s.queued.join(", ")) : "nothing"}</span></div></div>
+        <span>Queued</span><span>${s.queued.length ? esc(s.queued.join(", ")) : "nothing"}</span>
+        <span>Clock</span><span>${s.clock_offset ? `${s.clock_offset > 0 ? "+" : ""}${s.clock_offset} s off` : "correct"}</span>
+        <span>Card cache</span><span>${Object.keys(s.auth_cache).length ? Object.entries(s.auth_cache).map(([k, st]) => `💳 ${esc(k)}=${esc(st)}`).join(" ") : "empty"}</span>
+        ${s.pending_reset ? `<span>Reset</span><span>${badge("warn", "scheduled (OnIdle)")}</span>` : ""}</div></div>
       <div class="view"><h3>🖥️ CSMS thinks</h3><div class="kv">
         <span>Registration</span><span>${c ? regBadge(c.registration) : badge("idle", "unknown")}</span>
         <span>Connectivity</span><span>${connectivity(c)}</span>
         <span>Connectors</span><span>${c && Object.keys(c.connectors).length ? Object.entries(c.connectors).map(([k, st]) => `${esc(k)} ${connBadge(st)}`).join(" ") : "—"}</span>
+        ${c && Object.keys(c.availability).length ? `<span>Availability</span><span>${Object.entries(c.availability).map(([k, st]) => `${esc(k)} ${connBadge(st)}`).join(" ")}</span>` : ""}
+        ${c && c.security_events.length ? `<span>Security events</span><span class="mono">${c.security_events.map(esc).join("<br>")}</span>` : ""}
         ${c ? `<span>Boots</span><span>${c.boots}</span>` : ""}</div></div></div></details>
     <details data-key="${id}-tx"><summary>🧾 Transactions recorded by the CSMS</summary>${txs}</details>
     <details data-key="${id}-cmd"><summary>🖥️→🔌 Requests the CSMS can send (OCPP ${esc(v)} names)</summary>
@@ -225,8 +293,10 @@ function stationHtml({ id, station: s, csms: c }) {
         <input type="number" min="1" data-val="${id}-hb" value="20" aria-label="new heartbeat interval">
         <button ${!live ? "disabled" : ""} onclick="csms('${id}','set_heartbeat',{value:val('${id}-hb','20')})">${cmdLabel(s, "set_heartbeat")}</button></div>
       <div class="row"><button ${!live ? "disabled" : ""} onclick="csms('${id}','full_report')">${cmdLabel(s, "full_report")} (everything)</button>
-        <button ${!live ? "disabled" : ""} onclick="csms('${id}','reset')">${cmdLabel(s, "reset")}</button>
-        <select data-val="${id}-trig"><option>StatusNotification</option><option>Heartbeat</option><option>BootNotification</option><option>MeterValues</option></select>
+        <select data-val="${id}-rst">${(v === "1.6" ? ["Soft", "Hard"] : ["Immediate", "OnIdle"]).map((t) => `<option>${t}</option>`).join("")}</select>
+        <button ${!live ? "disabled" : ""} onclick="csms('${id}','reset',{type:val('${id}-rst','${v === "1.6" ? "Soft" : "Immediate"}')})">${cmdLabel(s, "reset")}</button>
+        <button ${!live ? "disabled" : ""} onclick="csms('${id}','clear_cache')">${cmdLabel(s, "clear_cache")}</button></div>
+      <div class="row"><select data-val="${id}-trig">${["StatusNotification", "Heartbeat", "BootNotification", "MeterValues", ...(v === "1.6" ? [] : ["TransactionEvent"])].map((t) => `<option>${t}</option>`).join("")}</select>
         <button ${!live ? "disabled" : ""} onclick="csms('${id}','trigger',{message:val('${id}-trig','StatusNotification')})">${cmdLabel(s, "trigger")}</button></div>
       <div class="row"><select data-val="${id}-av"><option>Inoperative</option><option>Operative</option></select>
         <button ${!live ? "disabled" : ""} onclick="csms('${id}','change_availability',{operational_status:val('${id}-av','Inoperative'),connector:0})">${cmdLabel(s, "change_availability")} (all)</button>

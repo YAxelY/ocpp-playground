@@ -146,7 +146,7 @@ class Csms:
         for sid in [s for s, r in self.stations.items() if not r.online]:
             del self.stations[sid]
         for rec in self.stations.values():
-            rec.boots, rec.registration = 0, "Unknown"
+            rec.boots, rec.registration, rec.pending_since, rec.pending_flow = 0, "Unknown", None, False
             rec.allowed_once.clear()
         self.bus.changed()
 

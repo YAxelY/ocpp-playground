@@ -178,3 +178,15 @@ pre.raw { margin: 6px 0 0; padding: 8px; background: var(--soft); border: 1px so
 .anatomy text { font-family: system-ui, sans-serif; font-size: 13px; fill: var(--ink); }
 .anatomy .muted { fill: var(--muted); font-size: 12px; }
 .anatomy .callout { fill: var(--warn); font-weight: 700; }
+
+/* optional behaviour panel */
+:root { --ref-bg: #eef2ff; --ref-ink: #3730a3; --ref-line: #c7d2fe; }
+@media (prefers-color-scheme: dark) { :root { --ref-bg: #1e1b4b; --ref-ink: #c7d2fe; --ref-line: #3730a3; } }
+.ref { display:inline-block; font-size:11px; padding:0 6px; border-radius:6px; background:var(--ref-bg); color:var(--ref-ink);
+       border:1px solid var(--ref-line); white-space:nowrap; }
+.opt { border-top:1px dashed var(--line); padding:6px 0; }
+.opt b { margin-right:6px; }
+.opt code { font-size:11px; }
+.members label { margin-right:8px; white-space:nowrap; }
+details h3 { margin:10px 0 2px; font-size:13px; }
+.reg { border:1px solid var(--line); border-radius:10px; padding:4px 10px; margin:6px 0; background:var(--soft); color:var(--ink); }

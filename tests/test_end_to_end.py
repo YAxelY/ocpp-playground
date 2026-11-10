@@ -29,7 +29,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bus = Bus(history=5000)
         self.csms = Csms(self.bus)
-        self.csms.policy.update({"heartbeat_interval": 2, "retry_interval": 1})
+        self.csms.policy.update({"heartbeat_interval": 2, "retry_interval": 1, "pending_for": 0, "pending_actions": []})
         port = free_port()
         self.url = f"ws://localhost:{port}/ocpp"
         self.server = await self.csms.serve("localhost", port)

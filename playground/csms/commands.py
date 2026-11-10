@@ -5,9 +5,11 @@ Commands have one generic name and a builder per protocol family, because the me
 | command | 2.0.1 / 2.1 | 1.6 |
 |---|---|---|
 | read_heartbeat | GetVariables(OCPPCommCtrlr.HeartbeatInterval) | GetConfiguration(HeartbeatInterval) |
+| read_variables | GetVariables(model, vendor, heartbeat, TxStartPoint, …) | GetConfiguration(a few keys) |
 | set_heartbeat | SetVariables(…) | ChangeConfiguration(HeartbeatInterval) |
 | full_report | GetBaseReport(FullInventory) → NotifyReport | GetConfiguration() (all keys, in the answer) |
-| reset | Reset(Immediate) | Reset(Soft) |
+| reset | Reset(Immediate / OnIdle) | Reset(Soft / Hard) |
+| clear_cache | ClearCache | ClearCache |
 | trigger | TriggerMessage | TriggerMessage |
 | change_availability | ChangeAvailability(operationalStatus, evse) | ChangeAvailability(connectorId, type) |
 | request_start | RequestStartTransaction | RemoteStartTransaction |
@@ -30,13 +32,21 @@ from ..protocol.frames import MessageType, error_frame
 
 _ids = itertools.count(1)
 
+# What "read_variables" asks for (a CSMS typically checks identity and key settings while a station is Pending).
+READ_SET = [("ChargingStation", "Model"), ("ChargingStation", "VendorName"), ("OCPPCommCtrlr", "HeartbeatInterval"),
+            ("TxCtrlr", "TxStartPoint"), ("AuthCtrlr", "LocalAuthorizeOffline")]
+READ_SET_16 = ["HeartbeatInterval", "MeterValueSampleInterval", "LocalAuthorizeOffline", "AuthorizeRemoteTxRequests"]
+
 BUILDERS_2X = {
     "read_heartbeat": lambda c, **a: c.GetVariables(get_variable_data=[
         {"component": {"name": "OCPPCommCtrlr"}, "variable": {"name": "HeartbeatInterval"}}]),
+    "read_variables": lambda c, **a: c.GetVariables(get_variable_data=[
+        {"component": {"name": comp}, "variable": {"name": var}} for comp, var in READ_SET]),
     "set_heartbeat": lambda c, value="20", **a: c.SetVariables(set_variable_data=[
         {"attribute_value": str(value), "component": {"name": "OCPPCommCtrlr"}, "variable": {"name": "HeartbeatInterval"}}]),
     "full_report": lambda c, **a: c.GetBaseReport(request_id=next(_ids), report_base="FullInventory"),
-    "reset": lambda c, **a: c.Reset(type="Immediate"),
+    "reset": lambda c, type="Immediate", **a: c.Reset(type=type if type in ("Immediate", "OnIdle") else "Immediate"),
+    "clear_cache": lambda c, **a: c.ClearCache(),
     "trigger": lambda c, message="StatusNotification", **a: c.TriggerMessage(requested_message=message),
     "change_availability": lambda c, operational_status="Inoperative", connector=0, **a: c.ChangeAvailability(
         operational_status=operational_status, **({"evse": {"id": int(connector)}} if int(connector) else {})),
@@ -47,9 +57,11 @@ BUILDERS_2X = {
 }
 BUILDERS_16 = {
     "read_heartbeat": lambda c, **a: c.GetConfiguration(key=["HeartbeatInterval"]),
+    "read_variables": lambda c, **a: c.GetConfiguration(key=READ_SET_16),
     "set_heartbeat": lambda c, value="20", **a: c.ChangeConfiguration(key="HeartbeatInterval", value=str(value)),
     "full_report": lambda c, **a: c.GetConfiguration(),
-    "reset": lambda c, **a: c.Reset(type="Soft"),
+    "reset": lambda c, type="Soft", **a: c.Reset(type=type if type in ("Soft", "Hard") else "Soft"),
+    "clear_cache": lambda c, **a: c.ClearCache(),
     "trigger": lambda c, message="StatusNotification", **a: c.TriggerMessage(requested_message=message),
     "change_availability": lambda c, operational_status="Inoperative", connector=0, **a: c.ChangeAvailability(
         connector_id=int(connector), type=operational_status),
@@ -114,7 +126,12 @@ async def run(csms, station_id: str, name: str, args: dict) -> dict:
         return {"ok": False, "error": code}
 
     result = dataclasses.asdict(response) if dataclasses.is_dataclass(response) else response
-    if version.name == "1.6" and name in ("full_report", "read_heartbeat"):
+    if version.is_2x and name in ("read_heartbeat", "read_variables"):          # keep what we learned
+        for item in result.get("get_variable_result") or []:
+            if item.get("attribute_value") is not None:
+                rec.variables[f"{item['component']['name']}.{item['variable']['name']}"] = item["attribute_value"]
+        csms.bus.changed()
+    if version.name == "1.6" and name in ("full_report", "read_heartbeat", "read_variables"):
         for item in result.get("configuration_key") or []:          # 1.6 returns the values in the answer
             rec.variables[item["key"]] = item.get("value")
         csms.bus.changed()

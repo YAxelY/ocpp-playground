@@ -26,9 +26,13 @@ from ..events import Bus
 from ..protocol import schemas
 from ..protocol.frames import FrameError, MessageType, error_frame, parse
 from ..protocol.versions import BY_SUBPROTOCOL, OcppVersion
+from .behaviour import Behaviour2x as Behaviour2xEvent
 from .behaviour import behaviour_for
 from .handlers import station_class
 from .model import CONFIG_16, Evse, default_variables
+from .options import BY_KEY, OPTIONS
+from .options import parse as parse_option
+from .options import text as option_text
 
 POWER_W = 11000          # simulated charging power
 
@@ -83,8 +87,14 @@ class Station:
         self.attempt = 0
         self.offline_since: float | None = None
         self.last_sent = 0.0               # any message resets the heartbeat timer (G02.FR.05 / 1.6 §4.6)
+        self.last_heartbeat = 0.0
         self.tx_queue: list = []           # (label, coroutine function) waiting for the connection
         self.streams: dict[int, dict] = {} # 2.1 periodic event streams
+        self.choices = {o.key: o.default for o in OPTIONS if not o.dm}   # implementation choices (no OCPP variable)
+        self.auth_cache: dict[str, str] = {}   # idToken -> last status the CSMS gave (C10 / 1.6 §3.4)
+        self.clock_offset = 0.0                # station clock minus real time (seconds)
+        self.security_event: str | None = None # A04: StartupOfTheDevice / ResetOrReboot, sent once Accepted (2.x)
+        self.pending_reset: str | None = None  # 2.x Reset OnIdle, done when the last transaction ends
         self.cp = None
         self.ws = None
         self._task: asyncio.Task | None = None
@@ -98,18 +108,64 @@ class Station:
     def var(self, key: str):
         return self.variables[key][0]
 
+    def opt(self, key: str):
+        """The current value of an optional behaviour (Device Model variable or implementation choice)."""
+        return self.variables[key][0] if key in self.variables else self.choices[key]
+
+    def set_option(self, key: str, value) -> str:
+        option = BY_KEY.get(key)
+        if option is None:
+            return "UnknownVariable"
+        try:
+            parsed = parse_option(option, value)
+        except (TypeError, ValueError):
+            return "Rejected"
+        if option.dm:
+            self.variables[key][0] = parsed
+        else:
+            self.choices[key] = parsed
+        self.bus.changed()
+        return "Accepted"
+
     def set_variable(self, key: str, value) -> str:
         entry = self.variables.get(key)
         if entry is None:
             return "UnknownVariable"
         if entry[1] != "ReadWrite":
             return "Rejected"
+        if key in BY_KEY:
+            return self.set_option(key, value)
         try:
             entry[0] = int(value) if isinstance(entry[0], int) else str(value)
         except ValueError:
             return "Rejected"
         self.bus.changed()
         return "Accepted"
+
+    # -- the station's own clock (B01.FR.06 / G02.FR.06 / 1.6 §4.6) ------------------------------
+    def clock(self) -> float:
+        return time.time() + self.clock_offset
+
+    def now_iso(self) -> str:
+        return now_iso(datetime.fromtimestamp(self.clock(), timezone.utc))
+
+    def sync_clock(self, current_time, source: str) -> None:
+        if self.opt("ClockCtrlr.TimeSource") != "Heartbeat" or not current_time:
+            return
+        try:
+            csms_time = datetime.fromisoformat(str(current_time).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return
+        offset = csms_time - time.time()
+        if abs(offset - self.clock_offset) > 2:
+            self.bus.note(self.id, f"Clock set from {source}.currentTime: corrected by {offset - self.clock_offset:+.0f} s",
+                          ref="1.6 §4.6" if self.version.name == "1.6" else "B01.FR.06 · G02.FR.06")
+        self.clock_offset = offset
+
+    def cache(self, token: str, status: str) -> None:
+        if self.opt("AuthCacheCtrlr.Enabled"):
+            self.auth_cache[token] = status
+            self.bus.changed()
 
     def config_16(self, key: str):
         """(value, readonly) of a 1.6 configuration key, or None if unknown."""
@@ -120,7 +176,9 @@ class Station:
             return None
         if isinstance(target, tuple):
             return target[0], True
-        return str(self.var(target)), self.variables[target][1] != "ReadWrite"
+        if target in self.variables:
+            return option_text(self.var(target)), self.variables[target][1] != "ReadWrite"
+        return option_text(self.choices[target]), False
 
     @property
     def accepted(self) -> bool:
@@ -133,8 +191,11 @@ class Station:
             "offer": list(self.offer), "registration": self.registration, "boot_on_reconnect": self.boot_on_reconnect,
             "activity": self.activity, "attempt": self.attempt, "queued": [label for label, _ in self.tx_queue],
             "heartbeat": self.var("OCPPCommCtrlr.HeartbeatInterval"), "streams": list(self.streams),
+            "options": {o.key: self.opt(o.key) for o in OPTIONS}, "auth_cache": dict(self.auth_cache),
+            "clock_offset": round(self.clock_offset), "pending_reset": self.pending_reset,
             "evses": {str(i): {"status": e.status, "operative": e.operative, "cable": e.cable, "fault": e.fault,
-                               "auth_token": e.auth_token,
+                               "auth_token": e.auth_token, "ev_suspended": e.ev_suspended,
+                               "evse_suspended": e.evse_suspended,
                                "tx": None if e.tx is None else {"id": e.tx.shown_id, "token": e.tx.token,
                                                                 "charging": e.tx.charging,
                                                                 "energy_wh": round(e.tx.energy_wh, 1), "seq": e.tx.seq}}
@@ -151,6 +212,8 @@ class Station:
             return
         self.power, self.need_boot, self.boot_reason, self.registration = True, True, "PowerUp", "—"
         self.attempt = 0
+        self.clock_offset = float(self.opt("ClockErrorAtStart"))   # a power cut may leave the clock wrong
+        self.security_event = "StartupOfTheDevice"
         self._task = asyncio.create_task(self._lifecycle())
 
     async def power_off(self) -> None:
@@ -160,9 +223,10 @@ class Station:
             if e.tx:
                 self.bus.note(self.id, f"Power lost during transaction {e.tx.shown_id}: it's gone (simulator)")
                 e.tx = None
-            e.auth_token, e.finishing = None, False
+            e.auth_token, e.auth_since, e.finishing, e.ev_suspended, e.evse_suspended = None, None, False, False, False
             e.status = self.behaviour.status_of(e)
         self.tx_queue.clear()
+        self.pending_reset = None
         self.registration, self.streams = "—", {}
         self._set("switched off")
 
@@ -179,9 +243,13 @@ class Station:
         self.bus.changed()
 
     async def reboot(self, reason: str, stop_reason: str | None = None) -> None:
-        for e in self.evses.values():
+        if self.version.is_2x and self.opt("ResetReportUnavailable") and self.accepted and self.cp:
+            for e in self.evses.values():                        # B11.FR.03: MAY report Unavailable first
+                e.status = "Unavailable"
+            await self.call(self.cp, Behaviour2xEvent(self).availability_event(list(self.evses.values())))
             if e.tx:
-                await self.behaviour.reset_stop(e)
+                await self.behaviour.reset_stop(e, *([stop_reason] if stop_reason else []))
+        self.security_event, self.pending_reset = "ResetOrReboot", None
         self.need_boot, self.boot_reason, self.registration = True, reason, "—"
         self.attempt = 0
         self._kick.set()
@@ -199,7 +267,7 @@ class Station:
 
     # ==================================================================== connection life cycle
     def _backoff(self) -> float:
-        """2.x Part 4 §5.3: minimum + random, doubled after each failure up to RepeatTimes."""
+        """2.x Part 4 §5.4: minimum + random, doubled after each failure up to RepeatTimes."""
         base = self.var("OCPPCommCtrlr.RetryBackOffWaitMinimum") * 2 ** min(
             self.attempt, self.var("OCPPCommCtrlr.RetryBackOffRepeatTimes"))
         return base + random.uniform(0, self.var("OCPPCommCtrlr.RetryBackOffRandomRange"))
@@ -275,9 +343,12 @@ class Station:
             await self._boot(cp, self.boot_reason if self.need_boot else "Unknown")
             self.need_boot, self.boot_reason = False, "PowerUp"
             await self.report(list(self.evses.values()), include_station=True, force=True)   # B01.FR.05
+            if self.version.is_2x and self.security_event:                  # A04.FR.01: critical security event
+                await self.call(cp, self.behaviour.security_event(self.security_event))
+                self.security_event = None
         else:
             self.bus.note(self.id, "Reconnected without a new BootNotification: boot data unchanged",
-                          ref=self.version.ref("§5.4" if self.version.name == "1.6" else "§5.3"))
+                          ref=self.version.ref("§5.4"))
             threshold = self.var("OCPPCommCtrlr.OfflineThreshold")
             if self.version.is_2x and offline_for is not None and offline_for > threshold:
                 self.bus.note(self.id, f"Offline {offline_for:.0f} s > OfflineThreshold {threshold} s → report all "
@@ -290,7 +361,7 @@ class Station:
                                        "whose status changed", ref=ref)
                 await self.report(changed, force=True)
         await self._flush_queue(cp)
-        await asyncio.gather(self._heartbeat_loop(cp), self._meter_loop(), self._stream_loop())
+        await asyncio.gather(self._heartbeat_loop(cp), self._meter_loop(), self._stream_loop(), self._aligned_loop())
 
     # ==================================================================== sending helpers
     async def call(self, cp, payload, **kwargs):
@@ -342,13 +413,29 @@ class Station:
         await self.ws.send(text)
 
     async def authorize(self, token: str) -> str:
+        """Check a card: authorization cache, local pre-authorize, offline rules, else an Authorize request."""
+        v16 = self.version.name == "1.6"
+        cached = self.auth_cache.get(token) if self.opt("AuthCacheCtrlr.Enabled") else None
         if not self.accepted:
-            # PLAYGROUND DECISION: accept unknown tokens while offline (configurable in real stations)
-            self.bus.note(self.id, f"Offline: card {token} accepted locally", "warn",
-                          "1.6 §3.5" if self.version.name == "1.6" else "C15")
+            if cached == "Accepted" and self.opt("AuthCtrlr.LocalAuthorizeOffline"):
+                self.bus.note(self.id, f"Offline: card {token} is Accepted in the authorization cache → accepted locally",
+                              ref="1.6 §3.5 (LocalAuthorizeOffline)" if v16 else "C12 · LocalAuthorizeOffline")
+                return "Accepted"
+            if cached is None and self.opt("AuthCtrlr.OfflineTxForUnknownIdEnabled"):
+                self.bus.note(self.id, f"Offline: card {token} unknown, unknown cards allowed offline → accepted", "warn",
+                              "1.6 §3.5 (AllowOfflineTxForUnknownId)" if v16 else "C15 · OfflineTxForUnknownIdEnabled")
+                return "Accepted"
+            self.bus.note(self.id, f"Offline: card {token} {'is ' + cached + ' in the cache' if cached else 'unknown'} "
+                                   "→ refused locally", "warn", "1.6 §3.5" if v16 else "C12 / C15")
+            return cached or "Invalid"
+        if cached == "Accepted" and self.opt("AuthCtrlr.LocalPreAuthorize"):
+            self.bus.note(self.id, f"Card {token} Accepted in the cache, LocalPreAuthorize = true → start without "
+                                   "Authorize", ref="1.6 §3.4" if v16 else "C12 · LocalPreAuthorize")
             return "Accepted"
         resp = await self.call(self.cp, self.behaviour.authorize_payload(token))
         status = self.behaviour.authorize_status(resp) if resp else "Invalid"
+        if resp:
+            self.cache(token, status)
         if status != "Accepted":
             self.bus.note(self.id, f"Card {token}: {status} → no charging", "warn")
         return status
@@ -359,15 +446,16 @@ class Station:
             self._set("sending BootNotification")
             resp = await self.call(cp, self.behaviour.boot_payload(reason))
             if resp is None:
-                wait = 10
+                wait = self.opt("BootWaitWhenZero")
             else:
                 self.registration = resp.status
+                self.sync_clock(resp.current_time, "BootNotificationResponse")
                 self.bus.changed()
                 if resp.status == "Accepted":
                     if resp.interval > 0:
                         self.variables["OCPPCommCtrlr.HeartbeatInterval"][0] = resp.interval
                     return
-                wait = resp.interval if resp.interval > 0 else 10      # interval 0: choose our own (decision: 10 s)
+                wait = resp.interval if resp.interval > 0 else self.opt("BootWaitWhenZero")   # B02.FR.06 / B03.FR.05
             self._set(f"{self.registration}: next BootNotification in {wait} s")
             try:
                 await asyncio.wait_for(self._boot_now.wait(), wait)      # TriggerMessage may ask earlier
@@ -377,7 +465,9 @@ class Station:
                 pass
 
     async def report(self, evses: list[Evse], include_station: bool = False, force: bool = False) -> None:
-        """Recompute statuses; send a StatusNotification for each one that changed (or all, with force)."""
+        """Recompute statuses; report each one that changed (or all, with force).
+        2.0.1: StatusNotification · 2.1: NotifyEvent AvailabilityState and/or StatusNotification · 1.6: StatusNotification,
+        delayed by MinimumStatusDuration if set (§4.9)."""
         to_send = []
         for e in evses:
             new = self.behaviour.status_of(e)
@@ -389,15 +479,31 @@ class Station:
                 e.changed_while_offline = True
             self.bus.changed()
             return
+        delay = self.opt("MinimumStatusDuration") if self.version.name == "1.6" and not force else 0
+        if delay:
+            for e in to_send:
+                asyncio.ensure_future(self._report_after(e, e.status, delay))
+            self.bus.changed()
+            return
         for payload in self.behaviour.status_payloads(to_send, include_station):
             await self.call(self.cp, payload)
         for e in to_send:
             e.changed_while_offline = False
         self.bus.changed()
 
+    async def _report_after(self, e: Evse, status: str, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if self.behaviour.status_of(e) != status:
+            self.bus.note(self.id, f"Connector {e.id}: {status} lasted < MinimumStatusDuration ({delay} s) → not reported",
+                          ref="1.6 §4.9")
+            return
+        if self.accepted and self.cp:
+            for payload in self.behaviour.status_payloads([e]):
+                await self.call(self.cp, payload)
+
     async def send_report(self, cp, request_id: int) -> None:
         data = [{"component": {"name": k.split(".")[0]}, "variable": {"name": k.split(".")[1]},
-                 "variable_attribute": [{"value": str(v[0]), "mutability": v[1]}]} for k, v in self.variables.items()]
+                 "variable_attribute": [{"value": option_text(v[0]), "mutability": v[1]}]} for k, v in self.variables.items()]
         await self.call(cp, self.version.call.NotifyReport(request_id=request_id, generated_at=now_iso(), seq_no=0,
                                                            report_data=data, tbc=False))
 
@@ -409,29 +515,44 @@ class Station:
             else:
                 self._boot_now.set()
         elif message == "Heartbeat":
-            await self.call(self.cp, C.Heartbeat())
-        elif message == "StatusNotification":
+            await self.heartbeat(self.cp)
+        elif message == "StatusNotification":                    # the requested message, also on 2.1
             targets = [self.evses[evse_id]] if evse_id in self.evses else list(self.evses.values())
-            for payload in self.behaviour.status_payloads(targets):     # allowed even if not Accepted
+            for payload in self.behaviour.status_payloads(targets, mode="StatusNotification"):
                 await self.call(self.cp, payload)
         elif message == "MeterValues":
-            for e in self.evses.values():
-                if e.tx:
-                    await self.behaviour.meter(e)
+            for e in ([self.evses[evse_id]] if evse_id in self.evses else self.evses.values()):
+                await self.behaviour.triggered_meter(e)
+        elif message == "TransactionEvent":
+            for e in ([self.evses[evse_id]] if evse_id in self.evses else self.evses.values()):
+                await self.behaviour.triggered_tx(e)
 
     async def after_transaction(self, e: Evse) -> None:
         if e.pending_operative is not None:                 # a "Scheduled" ChangeAvailability
             e.operative, e.pending_operative = e.pending_operative, None
             await self.report([e])
+        if self.pending_reset and not any(x.tx for x in self.evses.values()):
+            self.bus.note(self.id, "Last transaction ended → the scheduled reset (OnIdle) happens now", ref="B12.FR.01 / B12.FR.03")
+            asyncio.ensure_future(self.reboot("RemoteReset"))
 
     # ==================================================================== periodic loops
+    async def heartbeat(self, cp) -> None:
+        self.last_heartbeat = time.time()
+        resp = await self.call(cp, self.version.call.Heartbeat())
+        if resp is not None:
+            self.sync_clock(resp.current_time, "HeartbeatResponse")
+
     async def _heartbeat_loop(self, cp) -> None:
+        self.last_heartbeat = time.time()
         while True:
             interval = self.var("OCPPCommCtrlr.HeartbeatInterval")
             self._set(f"{self.registration} · OCPP {self.version.name} · Heartbeat every {interval} s")
-            await asyncio.sleep(max(0.2, min(1.0, self.last_sent + interval - time.time())))
-            if time.time() >= self.last_sent + self.var("OCPPCommCtrlr.HeartbeatInterval"):
-                await self.call(cp, self.version.call.Heartbeat())
+            # 1.6 §4.6 / G02.FR.05: any message may reset the timer; otherwise a Heartbeat every interval
+            since = self.last_sent if self.opt("HeartbeatResetOnTraffic") else self.last_heartbeat
+            await asyncio.sleep(max(0.2, min(1.0, since + interval - time.time())))
+            since = self.last_sent if self.opt("HeartbeatResetOnTraffic") else self.last_heartbeat
+            if time.time() >= since + self.var("OCPPCommCtrlr.HeartbeatInterval"):
+                await self.heartbeat(cp)
 
     async def _meter_loop(self) -> None:
         last: dict[int, float] = {}
@@ -443,7 +564,26 @@ class Station:
                     if time.time() - last.get(e.id, 0) >= self.var("SampledDataCtrlr.TxUpdatedInterval"):
                         last[e.id] = time.time()
                         await self.behaviour.meter(e)
+                timeout = self.opt("TxCtrlr.EVConnectionTimeOut")
+                if e.auth_token and not e.cable and e.auth_since and timeout and self.clock() - e.auth_since >= timeout:
+                    await self.behaviour.timeout(e)
             self.bus.changed()
+
+    async def _aligned_loop(self) -> None:
+        """Clock-aligned meter values at round times of the station clock (1.6 §4.7, J01.FR.14)."""
+        done = None
+        while True:
+            await asyncio.sleep(0.5)
+            interval = self.opt("AlignedDataCtrlr.Interval")
+            if not interval:
+                continue
+            slot = int(self.clock() // interval)
+            if done is None:
+                done = slot
+            if slot != done:
+                done = slot
+                for e in self.evses.values():
+                    await self.behaviour.aligned(e)
 
     async def _stream_loop(self) -> None:
         while True:
@@ -463,13 +603,11 @@ class Station:
         if e.cable or e.fault or not e.operative:
             self.bus.note(self.id, f"Connector {evse_id}: can't plug in now ({e.status})", "warn")
             return
-        e.cable = True
-        await self.behaviour.plug(e)
+        await self.behaviour.plug(e)                     # the behaviour records the cable change
 
     async def unplug(self, evse_id: int) -> None:
         e = self.evses[evse_id]
         if e.cable:
-            e.cable = False
             await self.behaviour.unplug(e)
 
     async def present_token(self, evse_id: int, token: str) -> None:
@@ -481,7 +619,14 @@ class Station:
         if fault:
             await self.behaviour.fault(e)
         else:
-            await self.report([e])
+            await self.behaviour.repaired(e)
+
+    async def ev_pause(self, evse_id: int, paused: bool) -> None:
+        e = self.evses[evse_id]
+        if not e.cable:
+            self.bus.note(self.id, f"EVSE {evse_id}: no car connected", "warn")
+            return
+        await self.behaviour.ev_pause(e, paused)
 
     async def open_stream(self) -> None:
         if not self.link or self.version.name != "2.1":
@@ -509,7 +654,7 @@ class Station:
             "heartbeat_now": [2, uid, "Heartbeat", {}],
             "unknown_action": [2, uid, "MakeCoffee", {}],
             "unsupported_action": ([2, uid, "SignCertificate", {"csr": "x"}] if v16 else
-                                   [2, uid, "SecurityEventNotification", {"type": "SettingSystemTime", "timestamp": now_iso()}]),
+                                   [2, uid, "LogStatusNotification", {"status": "Idle"}]),
             "malformed": '[2, "broken-1", "Heartbeat", {',
             "unreadable_id": [2, 12345, "Heartbeat", {}],
             "long_id": [2, "x" * 40, "Heartbeat", {}],

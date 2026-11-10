@@ -15,6 +15,7 @@ from ocpp.routing import after, on
 
 from ..protocol.versions import OcppVersion
 from .model import CONFIG_16
+from .options import text as option_text
 
 
 class StationCommon:
@@ -43,7 +44,7 @@ class StationHandlers2x(StationCommon):
             status = "Accepted" if entry else ("UnknownVariable" if known_component else "UnknownComponent")
             result = {"attribute_status": status, "component": item["component"], "variable": item["variable"]}
             if entry:
-                result["attribute_value"] = str(entry[0])
+                result["attribute_value"] = option_text(entry[0])
             results.append(result)
         return self.R.GetVariables(get_variable_result=results)
 
@@ -72,12 +73,28 @@ class StationHandlers2x(StationCommon):
 
     @on("Reset")
     def on_reset(self, type, evse_id=None, **_):
-        return self.R.Reset(status="Accepted")
+        st = self.station
+        if type == "OnIdle" and any(e.tx for e in st.evses.values()):
+            st.pending_reset = "OnIdle"                 # B12.FR.01: reset when the transactions have ended
+            st.bus.note(st.id, "Reset OnIdle during a transaction → Scheduled", ref="B12.FR.01")
+            return self.R.Reset(status="Scheduled")
+        return self.R.Reset(status="Accepted")          # Immediate: stop transactions first (B12.FR.02/04)
 
     @after("Reset")
     async def after_reset(self, type, **_):
+        if self.station.pending_reset:
+            return
         await asyncio.sleep(0.3)
-        await self.station.reboot("RemoteReset")
+        await self.station.reboot("RemoteReset", "ImmediateReset")
+
+    @on("ClearCache")
+    def on_clear_cache(self, **_):
+        st = self.station
+        if not st.opt("AuthCacheCtrlr.Enabled"):
+            return self.R.ClearCache(status="Rejected")
+        st.auth_cache.clear()
+        st.bus.changed()
+        return self.R.ClearCache(status="Accepted")
 
     @on("RequestStartTransaction")
     def on_request_start(self, id_token, remote_start_id, evse_id=None, **_):
@@ -105,9 +122,9 @@ class StationHandlers2x(StationCommon):
     async def after_request_stop(self, transaction_id, **_):
         e = self.station.behaviour.find_tx(transaction_id)
         if e:
-            await self.station.behaviour.end(e, "RemoteStop", "Remote")
+            await self.station.behaviour.remote_stop(e)
 
-    SUPPORTED_TRIGGERS = {"BootNotification", "Heartbeat", "StatusNotification"}
+    SUPPORTED_TRIGGERS = {"BootNotification", "Heartbeat", "StatusNotification", "MeterValues", "TransactionEvent"}
 
     @on("TriggerMessage")
     def on_trigger(self, requested_message, evse=None, **_):
@@ -164,7 +181,7 @@ class StationHandlers16(StationCommon):
 
     @after("Reset")
     async def after_reset(self, type, **_):
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.3)                        # 1.6 §5.14: Soft stops transactions gracefully, Hard may not
         await self.station.reboot("RemoteReset", stop_reason="HardReset" if type == "Hard" else "SoftReset")
 
     @on("RemoteStartTransaction")
@@ -187,7 +204,7 @@ class StationHandlers16(StationCommon):
     async def after_remote_stop(self, transaction_id, **_):
         e = self.station.behaviour.find_tx(transaction_id)
         if e:
-            await self.station.behaviour.end(e, "Remote")
+            await self.station.behaviour.remote_stop(e)
 
     SUPPORTED_TRIGGERS = {"BootNotification", "Heartbeat", "StatusNotification", "MeterValues"}
 
@@ -211,6 +228,11 @@ class StationHandlers16(StationCommon):
 
     @on("ClearCache")
     def on_clear_cache(self, **_):
+        st = self.station                               # 1.6 §5.4: Rejected if the cache can't be cleared
+        if not st.opt("AuthCacheCtrlr.Enabled"):
+            return self.R.ClearCache(status="Rejected")
+        st.auth_cache.clear()
+        st.bus.changed()
         return self.R.ClearCache(status="Accepted")
 
 

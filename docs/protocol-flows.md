@@ -51,8 +51,8 @@ stateDiagram-v2
     Pending --> Booting: after interval (or TriggerMessage)
     Rejected --> Booting: after interval (B03.FR.06)
     Accepted --> Backoff: connection lost
-    Backoff --> Connecting: back-off elapsed (Part 4 §5.3)
-    Connecting --> Accepted: reconnect, no new boot (Part 4 §5.3)
+    Backoff --> Connecting: back-off elapsed (Part 4 §5.4)
+    Connecting --> Accepted: reconnect, no new boot (Part 4 §5.4)
     Accepted --> Booting: Reset / reboot
     Accepted --> Off: power off
 ```
@@ -159,7 +159,7 @@ At boot a 1.6 charge point also reports **connectorId 0** (the charge point itse
 connectors `0`, `1`, `2`… A transaction started while offline is queued; its id only exists once the queued
 StartTransaction reaches the CSMS after the reconnect.
 
-## 5. Connection loss, back-off and offline behaviour (Part 4 §5.3, B04, E04/E12)
+## 5. Connection loss, back-off and offline behaviour (Part 4 §5.4, B04, E04/E12)
 
 ```mermaid
 sequenceDiagram

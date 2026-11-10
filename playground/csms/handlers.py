@@ -10,10 +10,14 @@
 from __future__ import annotations
 
 import itertools
+import time
 from collections import deque
 from datetime import datetime, timezone
 
-from ocpp.routing import on
+import asyncio
+from datetime import timedelta
+
+from ocpp.routing import after, on
 
 from ..protocol.versions import OcppVersion
 from .state import Transaction
@@ -34,19 +38,29 @@ class CsmsCommon:
         rec, policy = self.rec, self.csms.policy
         rec.boots += 1
         rec.model, rec.vendor, rec.firmware = model, vendor, firmware or ""
-        if policy.registration_mode == "accept":
-            status = "Accepted"
-        elif policy.registration_mode == "reject":
-            status = "Rejected"
-        else:                                   # first boot we've seen → Pending, then Accepted
-            status = "Pending" if rec.boots == 1 else "Accepted"
+        mode, left = policy.registration_mode, None
+        if mode in ("accept", "reject", "pending"):
+            status = {"accept": "Accepted", "reject": "Rejected", "pending": "Pending"}[mode]
+        else:                                   # Pending for `pending_for` s, then the final answer
+            if rec.pending_since is None:
+                rec.pending_since = time.time()
+                status = "Pending"
+            elif time.time() - rec.pending_since < policy.pending_for:
+                status = "Pending"
+            else:
+                status = "Accepted" if mode == "pending_then_accept" else "Rejected"
+            if status == "Pending":
+                left = max(0, policy.pending_for - (time.time() - rec.pending_since))
         rec.registration = status
         if status == "Accepted":
             rec.allowed_once.clear()
+        if status != "Pending":
+            rec.pending_flow = False
         interval = policy.heartbeat_interval if status == "Accepted" else policy.retry_interval
         ref = "1.6 §4.2" if self.version.name == "1.6" else {"Accepted": "B01", "Pending": "B02", "Rejected": "B03"}[status]
+        extra = f" · the CSMS keeps it Pending {left:.0f} s more" if left is not None else ""
         self.csms.bus.note(rec.id, f"BootNotification{f' (reason {reason})' if reason else ''} → {status}, "
-                                   f"interval {interval} s", ref=ref)
+                                   f"interval {interval} s{extra}", ref=ref)
         self.csms.bus.changed()
         return status, interval
 
@@ -55,6 +69,53 @@ class CsmsCommon:
         if self.csms.policy.authorize_detail == "accepted_or_invalid" and status != "Accepted":
             status = "Invalid"
         return status
+
+    def token_info(self, token: str, expiry_field: str) -> dict:
+        """idTokenInfo (2.x) / idTagInfo (1.6), with the optional cache expiry (C10 / 1.6 §7.27) if the policy says so."""
+        info = {"status": self.token_status(token)}
+        minutes = self.csms.policy.cache_expiry_minutes
+        if minutes:
+            info[expiry_field] = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat(
+                timespec="seconds").replace("+00:00", "Z")
+        return info
+
+    def after_boot(self, status: str) -> None:
+        """Optional CSMS actions after answering a BootNotification (all allowed, none required)."""
+        policy, rec = self.csms.policy, self.rec
+        if status == "Pending" and not rec.pending_flow and policy.pending_actions:
+            rec.pending_flow = True
+            asyncio.ensure_future(self.pending_flow())
+        elif status == "Accepted" and policy.report_after_accept:
+            async def report():
+                from . import commands
+                await asyncio.sleep(1)
+                await commands.run(self.csms, rec.id, "full_report", {})
+            asyncio.ensure_future(report())
+
+    async def pending_flow(self) -> None:
+        """B02.FR.01 / 1.6 §4.2: while Pending the CSMS MAY read / change the station, then ask for a new boot."""
+        from . import commands
+        policy, rec, sid = self.csms.policy, self.rec, self.rec.id
+        v16 = self.version.name == "1.6"
+        steps = {"get_variables": ("read_variables", {}, "reads some settings", "1.6 §4.2" if v16 else "B02.FR.01 · B06"),
+                 "get_base_report": ("full_report", {}, "asks for the full configuration", "1.6 §4.2" if v16 else "B02.FR.01 · B07"),
+                 "set_variables": ("set_heartbeat", {"value": str(policy.heartbeat_interval)},
+                                   "changes a setting (heartbeat interval)", "1.6 §4.2" if v16 else "B02.FR.01 · B05")}
+        await asyncio.sleep(policy.pending_action_delay)
+        for action in [a for a in policy.pending_actions if a in steps]:
+            if rec.registration != "Pending":
+                return
+            name, args, what, ref = steps[action]
+            self.csms.bus.note(sid, f"While Pending, the CSMS {what}", ref=ref)
+            await commands.run(self.csms, sid, name, args)
+            await asyncio.sleep(1)
+        if "trigger_boot" in policy.pending_actions and policy.registration_mode.startswith("pending_then"):
+            wait = (rec.pending_since or time.time()) + policy.pending_for - time.time()
+            await asyncio.sleep(max(0, wait))
+            if rec.registration == "Pending":
+                self.csms.bus.note(sid, "Pending time is over: the CSMS asks for a new BootNotification now",
+                                   ref="1.6 §5.17" if v16 else "B02.FR.04 · F06")
+                await commands.run(self.csms, sid, "trigger", {"message": "BootNotification"})
 
     def tx(self, tx_id: str, **init) -> Transaction:
         tx = self.rec.transactions.get(tx_id)
@@ -71,19 +132,27 @@ class CsmsHandlers2x(CsmsCommon):
                                                     charging_station.get("firmware_version", ""), reason)
         return self.R.BootNotification(current_time=now_iso(), interval=interval, status=status)
 
+    @after("BootNotification")
+    def after_boot_notification(self, **_):
+        self.after_boot(self.rec.registration)
+
     @on("Heartbeat")
     def on_heartbeat(self, **_):
         return self.R.Heartbeat(current_time=now_iso())
 
     @on("StatusNotification")
     def on_status_notification(self, timestamp, connector_status, evse_id, connector_id, **_):
+        if self.version.name == "2.1" and not self.rec.deprecated_noted:
+            self.rec.deprecated_noted = True
+            self.csms.bus.note(self.rec.id, "StatusNotification is deprecated in 2.1 (NotifyEvent AvailabilityState is "
+                                            "preferred) but still accepted", ref="2.1 G01 remarks")
         self.rec.connectors[f"{evse_id}/{connector_id}"] = connector_status
         self.csms.bus.changed()
         return self.R.StatusNotification()
 
     @on("Authorize")
     def on_authorize(self, id_token, **_):
-        return self.R.Authorize(id_token_info={"status": self.token_status(id_token["id_token"])})
+        return self.R.Authorize(id_token_info=self.token_info(id_token["id_token"], "cache_expiry_date_time"))
 
     @on("TransactionEvent")
     def on_transaction_event(self, event_type, timestamp, trigger_reason, seq_no, transaction_info,
@@ -107,7 +176,7 @@ class CsmsHandlers2x(CsmsCommon):
         response = {}
         if id_token:
             tx.id_token = id_token["id_token"]
-            response["id_token_info"] = {"status": self.token_status(id_token["id_token"])}
+            response["id_token_info"] = self.token_info(id_token["id_token"], "cache_expiry_date_time")
         self.csms.bus.changed()
         return self.R.TransactionEvent(**response)
 
@@ -122,9 +191,31 @@ class CsmsHandlers2x(CsmsCommon):
     @on("NotifyEvent")
     def on_notify_event(self, generated_at, seq_no, event_data, **_):
         for ev in event_data:
-            self.csms.bus.note(self.rec.id, f"NotifyEvent {ev['component']['name']}.{ev['variable']['name']} = "
-                                            f"{ev.get('actual_value')} ({ev.get('trigger')})")
+            comp, var, value = ev["component"], ev["variable"]["name"], ev.get("actual_value")
+            evse = comp.get("evse") or {}
+            if var == "AvailabilityState" and comp["name"] == "Connector":      # 2.1 G01 / B01.FR.05
+                self.rec.connectors[f"{evse.get('id')}/{evse.get('connector_id', 1)}"] = value
+            elif var == "AvailabilityState":
+                self.rec.availability[comp["name"] + (f" {evse['id']}" if evse else "")] = value
+            else:
+                self.csms.bus.note(self.rec.id, f"NotifyEvent {comp['name']}{' ' + str(evse.get('id')) if evse else ''}."
+                                                f"{var} = {value} ({ev.get('trigger')})")
+        self.csms.bus.changed()
         return self.R.NotifyEvent()
+
+    @on("SecurityEventNotification")
+    def on_security_event(self, type, timestamp, **_):
+        self.rec.security_events.append(f"{timestamp} {type}")             # A04.FR.03: confirm receipt
+        self.csms.bus.note(self.rec.id, f"Security event: {type}", ref="A04")
+        self.csms.bus.changed()
+        return self.R.SecurityEventNotification()
+
+    @on("MeterValues")
+    def on_meter_values(self, evse_id, meter_value, **_):
+        values = [f"{sv.get('measurand', 'Energy.Active.Import.Register')}={sv['value']}"
+                  for mv in meter_value for sv in mv.get("sampled_value", [])]
+        self.csms.bus.note(self.rec.id, f"MeterValues EVSE {evse_id}: {', '.join(values)}", ref="J01")
+        return self.R.MeterValues()
 
     @on("DataTransfer")
     def on_data_transfer(self, vendor_id, **_):
@@ -150,6 +241,10 @@ class CsmsHandlers16(CsmsCommon):
         status, interval = self.decide_registration(charge_point_model, charge_point_vendor, firmware_version, None)
         return self.R.BootNotification(current_time=now_iso(), interval=interval, status=status)
 
+    @after("BootNotification")
+    def after_boot_notification(self, **_):
+        self.after_boot(self.rec.registration)
+
     @on("Heartbeat")
     def on_heartbeat(self, **_):
         return self.R.Heartbeat(current_time=now_iso())
@@ -162,7 +257,7 @@ class CsmsHandlers16(CsmsCommon):
 
     @on("Authorize")
     def on_authorize(self, id_tag, **_):
-        return self.R.Authorize(id_tag_info={"status": self.token_status(id_tag)})
+        return self.R.Authorize(id_tag_info=self.token_info(id_tag, "expiry_date"))
 
     @on("StartTransaction")
     def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **_):
@@ -172,10 +267,13 @@ class CsmsHandlers16(CsmsCommon):
         status = self.token_status(id_tag)
         self.csms.bus.note(self.rec.id, f"StartTransaction → CSMS assigns transactionId {tx_id}", ref="1.6 §4.8")
         self.csms.bus.changed()
-        return self.R.StartTransaction(transaction_id=tx_id, id_tag_info={"status": status})
+        return self.R.StartTransaction(transaction_id=tx_id, id_tag_info=self.token_info(id_tag, "expiry_date"))
 
     @on("MeterValues")
     def on_meter_values(self, connector_id, meter_value, transaction_id=None, **_):
+        contexts = {sv.get("context", "Sample.Periodic") for mv in meter_value for sv in mv.get("sampled_value", [])}
+        if "Sample.Clock" in contexts:
+            self.csms.bus.note(self.rec.id, f"Clock-aligned MeterValues for connector {connector_id}", ref="1.6 §4.7")
         if transaction_id is not None and str(transaction_id) in self.rec.transactions:
             tx = self.rec.transactions[str(transaction_id)]
             tx.state = "Updated"
@@ -192,7 +290,7 @@ class CsmsHandlers16(CsmsCommon):
         tx.state, tx.charging_state, tx.energy_wh = "Ended", "Finishing", float(meter_stop)
         tx.ended_at, tx.stopped_reason = timestamp, reason or "Local"     # 1.6 §4.10: missing reason = Local
         self.csms.bus.changed()
-        return self.R.StopTransaction(**({"id_tag_info": {"status": self.token_status(id_tag)}} if id_tag else {}))
+        return self.R.StopTransaction(**({"id_tag_info": self.token_info(id_tag, "expiry_date")} if id_tag else {}))
 
     @on("DataTransfer")
     def on_data_transfer(self, vendor_id, **_):

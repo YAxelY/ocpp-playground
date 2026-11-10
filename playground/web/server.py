@@ -2,6 +2,7 @@
 
 Client → server messages (JSON):
   {"cmd": "station", "id": "CS-001", "action": "plug", "evse": 1}       button on a station card
+  {"cmd": "station", "id": "CS-001", "action": "set_option", "key": "TxCtrlr.TxStartPoint", "value": "..."}
   {"cmd": "csms", "id": "CS-001", "command": "reset", "args": {...}}      CSMS-initiated request
   {"cmd": "policy", ...fields}                                            change CSMS behaviour
   {"cmd": "add_station", "offer": ["ocpp2.1"], "evses": 1}
@@ -24,6 +25,7 @@ from websockets.http11 import Response
 
 from ..csms import commands
 from ..protocol import ALL, BY_NAME, schemas
+from ..station import options
 
 STATIC = Path(__file__).parent / "static"
 
@@ -36,6 +38,8 @@ STATION_ACTIONS = {
     "unplug": lambda st, m: st.unplug(int(m["evse"])),
     "token": lambda st, m: st.present_token(int(m["evse"]), m.get("token") or "AXEL-0001"),
     "fault": lambda st, m: st.set_fault(int(m["evse"]), True),
+    "ev_pause": lambda st, m: st.ev_pause(int(m["evse"]), True),
+    "ev_resume": lambda st, m: st.ev_pause(int(m["evse"]), False),
     "clear_fault": lambda st, m: st.set_fault(int(m["evse"]), False),
     "open_stream": lambda st, m: st.open_stream(),
     "close_stream": lambda st, m: st.close_stream(),
@@ -72,7 +76,7 @@ class Dashboard:
         queue = bus.subscribe()
         try:
             await ws.send(json.dumps({"type": "hello", "history": list(bus.history), **self.pg.snapshot(),
-                                      "meta": self.meta()}))
+                                      "meta": {**self.meta(), "csms_url": self.pg.csms_url}}))
             pusher = asyncio.create_task(self._push(ws, queue))
             try:
                 async for text in ws:
@@ -102,6 +106,10 @@ class Dashboard:
             station = pg.stations[msg["id"]]
             if msg["action"] == "boot_on_reconnect":
                 station.boot_on_reconnect = bool(msg.get("value"))
+            elif msg["action"] == "set_option":
+                result = station.set_option(msg["key"], msg.get("value"))
+                pg.bus.note(station.id, f"Option {msg['key']} = {msg.get('value')} → {result}",
+                            "info" if result == "Accepted" else "warn")
             else:
                 await STATION_ACTIONS[msg["action"]](station, msg)
         elif cmd == "csms":
@@ -131,5 +139,6 @@ class Dashboard:
                 "versions": [v.name for v in ALL],
                 "catalogue": schemas.catalogue(),
                 "commands": {v.name: {c: commands.message_name(v, c) for c in commands.COMMANDS} for v in ALL},
+                "options": options.catalogue(),
             }
         return cls._meta
